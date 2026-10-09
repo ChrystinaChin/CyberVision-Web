@@ -2061,4 +2061,4 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
 
     has_fire = (
         any("fire" in item for item in classes)
-        or "fire" in description
+        or "fire" in description)
