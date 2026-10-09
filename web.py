@@ -9,7 +9,6 @@ import sqlite3
 import threading
 import time
 import wave
-from concurrent.futures import ThreadPoolExecutor
 from collections import deque
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
@@ -19,6 +18,9 @@ import numpy as np
 import pandas as pd
 import psutil
 import streamlit as st
+
+# Initialize psutil counter once globally for non-blocking reads
+psutil.cpu_percent(interval=None)
 
 # Must be the absolute first Streamlit command executed
 st.set_page_config(
@@ -111,7 +113,6 @@ def local_camera_available() -> bool:
     except Exception:
         return False
 
-
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -120,32 +121,37 @@ CONFIG: Dict[str, Any] = {
     "APP_SUBTITLE": "Adaptive Context Optimization at the Edge",
     "VLM_MODEL": "moondream",
     "CAMERA_INDEX": 0,
-    "CAMERA_SOURCES": [0, 1, 2, 3, 4, 5, 6, 7, 8],  # 3x3 Grid Sources
+    "CAMERA_SOURCES": [0],  # Primary webcam only; prevents duplicate/phantom camera feeds
     "FRAME_WIDTH": 640,
     "FRAME_HEIGHT": 300,
     "JPEG_QUALITY": 70,
-    "FRAME_DELAY_SEC": 0.0,
-    "ANALYZE_EVERY_N_FRAMES": 12,
-    "CPU_THRESHOLD": 95,
-    "RAM_THRESHOLD": 90,
+    "FRAME_DELAY_SEC": 0.22,
+    "ANALYZE_EVERY_N_FRAMES": 6,
+    "CPU_THRESHOLD": 85,
+    "RAM_THRESHOLD": 85,
     "ALERT_HISTORY_MAX": 100,
-    "METRICS_HISTORY_MAX": 150,
-    "LATENCY_HISTORY_MAX": 100,
+    "METRICS_HISTORY_MAX": 100,
+    "LATENCY_HISTORY_MAX": 50,
     "TOAST_DISPLAY_SECONDS": 6.0,
     "YARA_RULE_PATH": "hazard_rules.yar",
-    # GCP Credentials & Bucket Configuration
     "GCP_BUCKET": "cybervision_history",
-    "GCP_PROJECT_ID": "c5c505d599a4735f61c6c6896dd3f47a2c28337b",
+    "GCP_PROJECT_ID": "project-dc6771c8-2eaf-4371-b74",
     "DB_FILE": "cybervision_buffer.db",
     "PENDING_UPLOADS_DIR": "pending_gcp_uploads",
-    "YOLO_MODEL_PATH": os.path.join(
-        os.path.dirname(os.path.abspath(__file__)),
-        "YOLO_dataset.pt",
+    "YOLO_MODEL_PATH": next(
+        (
+            p for p in (
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt"),
+                os.path.join(os.path.dirname(os.path.abspath(__file__)), "YOLO_dataset.pt"),
+            )
+            if os.path.isfile(p)
+        ),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "best.pt"),
     ),
-    "YOLO_CONFIDENCE": 0.45,
-    "YOLO_IMAGE_SIZE": 160,       # Reduced from 320 to accelerate CPU inference
-    "YOLO_EVERY_N_FRAMES": 6,     # Run real inference every 6th tick; reuse last result otherwise
-    "VISUAL_DETECT_EVERY_N_FRAMES": 3,  # HSV/YCrCb color analysis is CPU-heavy; don't run it every tick
+    "YOLO_CONFIDENCE": 0.15,
+    "YOLO_IMAGE_SIZE": 640,
+    "THROTTLE_MIN_INTERVAL": 0.75,
+    "THROTTLE_YOLO_IMAGE_SIZE": 320,
 }
 
 SEVERITY_STYLE = {
@@ -156,7 +162,6 @@ SEVERITY_STYLE = {
 }
 
 VLM_RESULT_QUEUE: queue.Queue = queue.Queue()
-YOLO_RESULT_QUEUE: queue.Queue = queue.Queue()
 
 
 # =============================================================================
@@ -178,23 +183,66 @@ def init_db() -> None:
         conn.commit()
 
 
-def save_event_locally(timestamp: float, severity: str, description: str, camera_id: str = "CAM_01") -> None:
-    with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
+def save_event_locally(
+    timestamp: float,
+    severity: str,
+    description: str,
+    camera_id: str = "CAM_01",
+) -> None:
+  # Convert float timestamp to a human-readable string format
+  formatted_ts = datetime.fromtimestamp(timestamp).strftime(
+      "%Y-%m-%d %H:%M:%S"
+  )
+
+  with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
+    cursor = conn.cursor()
+    cursor.execute(
+        """
             INSERT INTO pending_events (timestamp, severity, description, camera_id, synced)
             VALUES (?, ?, ?, ?, 0)
-        """, (timestamp, severity, description, camera_id))
-        conn.commit()
+        """,
+        (formatted_ts, severity, description, camera_id),
+    )
+    conn.commit()
 
 
-def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: int = 2) -> bool:
+def _probe_network(host: str, port: int, timeout: float) -> bool:
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
-        return True
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
     except OSError:
         return False
+
+
+def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: float = 2) -> bool:
+    if _probe_network(host, port, timeout):
+        return True
+    if _probe_network("1.1.1.1", 53, timeout):
+        return True
+    # Hosted platforms often block raw DNS-port probes; HTTPS to Google
+    # APIs is what the cloud sync actually needs.
+    return _probe_network("storage.googleapis.com", 443, timeout)
+
+
+@st.cache_resource(show_spinner=False)
+def get_network_monitor() -> Dict[str, Any]:
+    state: Dict[str, Any] = {"online": is_wifi_connected(timeout=1.5), "checked_at": time.time()}
+
+    def _loop() -> None:
+        while True:
+            time.sleep(3.0)
+            try:
+                state["online"] = is_wifi_connected(timeout=1.5)
+                state["checked_at"] = time.time()
+            except Exception:
+                pass
+
+    threading.Thread(target=_loop, daemon=True).start()
+    return state
+
+
+def is_network_online() -> bool:
+    return bool(get_network_monitor()["online"])
 
 
 def sync_worker_loop() -> None:
@@ -221,19 +269,23 @@ def sync_worker_loop() -> None:
                         })
                         cursor.execute("UPDATE pending_events SET synced = 1 WHERE id = ?", (event_id,))
                     conn.commit()
-            except Exception:
-                pass
+            except Exception as exc:
+                print(f"[GCP sync] Firestore sync failed: {exc!r}", flush=True)
 
             flush_pending_cloud_uploads()
         time.sleep(10)
 
 
+@st.cache_resource(show_spinner=False)
+def _start_sync_thread_once() -> bool:
+    init_db()
+    threading.Thread(target=sync_worker_loop, daemon=True).start()
+    return True
+
+
 def start_sync_thread() -> None:
-    if "sync_thread_started" not in st.session_state:
-        init_db()
-        sync_thread = threading.Thread(target=sync_worker_loop, daemon=True)
-        sync_thread.start()
-        st.session_state.sync_thread_started = True
+    _start_sync_thread_once()
+    st.session_state.sync_thread_started = True
 
 
 # =============================================================================
@@ -256,14 +308,12 @@ def init_session_state() -> None:
         "vlm_context": "READY",
         "last_error": "",
         "last_public_notice": "",
-        "cloud_sync_enabled": False,
         "fps": 0.0,
         "last_frame_time": time.time(),
         "latest_detection": None,
         "yolo_severity": "NORMAL",
         "yolo_detector": None,
         "yolo_detection": None,
-        "yolo_detection_in_progress": False,
         "last_vlm_candidate_frame": None,
         "latest_vlm_text": "",
         "alarm_active": False,
@@ -271,14 +321,17 @@ def init_session_state() -> None:
         "last_triggered_alert_ts": 0.0,
         "active_hazard_toast": None,
         "active_page": "Dashboard",
+        "throttle_active": False,
+        "last_detection_run_ts": 0.0,
         "webrtc_ctx": None,
-        "_frame_processing_busy": False,
     }
 
     for key, value in defaults.items():
         if key not in st.session_state:
             st.session_state[key] = value
 
+    # Hosted servers have no physical camera, so use the visitor's browser
+    # camera (WebRTC). On a machine with a real camera, behave like localhost.
     if "use_webrtc" not in st.session_state:
         needs_browser_camera = is_cloud_environment() or not local_camera_available()
         st.session_state.use_webrtc = needs_browser_camera and WEBRTC_AVAILABLE
@@ -306,7 +359,7 @@ def inject_custom_css() -> None:
             color: {text} !important;
         }}
 
-        /* STABILIZE LIVE VIDEO CONTAINER TO PREVENT DISAPPEARING/BLINKING */
+        /* Keep the live video from blinking while a fragment reruns */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
         div[data-testid="stElementContainer"],
@@ -319,6 +372,24 @@ def inject_custom_css() -> None:
             transition: none !important;
             filter: none !important;
             animation: none !important;
+        }}
+
+        /* Hidden WebRTC transport widget (browser camera) */
+        .st-key-webrtc_transport {{
+            height: 0 !important;
+            min-height: 0 !important;
+            max-height: 0 !important;
+            overflow: hidden !important;
+            margin: 0 !important;
+            padding: 0 !important;
+            border: 0 !important;
+        }}
+        .st-key-webrtc_transport iframe {{
+            height: 1px !important;
+            min-height: 1px !important;
+            max-height: 1px !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
         }}
 
         .main .block-container {{
@@ -452,11 +523,22 @@ def inject_custom_css() -> None:
             transform: translateY(-1px);
         }}
 
+        div[data-testid="stElementContainer"]:has(.hazard-toast),
+        div[data-testid="stMarkdown"]:has(.hazard-toast),
+        div[data-testid="stMarkdownContainer"]:has(.hazard-toast) {{
+            opacity: 1 !important;
+            filter: none !important;
+            transform: none !important;
+            transition: none !important;
+        }}
+
         .hazard-toast {{
-            position: fixed;
-            top: 4.5rem;
+            position: fixed !important;
+            top: 4rem;
             right: 1.1rem;
-            z-index: 1000000;
+            z-index: 2147483647 !important;
+            opacity: 1 !important;
+            isolation: isolate;
             background: #ffffff;
             border: 1px solid {border};
             border-left: 7px solid {accent};
@@ -627,15 +709,36 @@ def inject_custom_css() -> None:
         }}
 
         .st-key-cpu_metric_high [data-testid="stMetricValue"],
-        .st-key-ram_metric_high [data-testid="stMetricValue"],
-        .st-key-cpu_metric_high [data-testid="stMetricDelta"],
-        .st-key-ram_metric_high [data-testid="stMetricDelta"] {{
+        .st-key-ram_metric_high [data-testid="stMetricValue"] {{
             color: #ff3b30 !important;
         }}
 
+        .st-key-cpu_metric_high [data-testid="stMetricDelta"],
+        .st-key-ram_metric_high [data-testid="stMetricDelta"],
+        .st-key-cpu_metric_high [data-testid="stMetricDelta"] span,
+        .st-key-ram_metric_high [data-testid="stMetricDelta"] span,
         .st-key-cpu_metric_high [data-testid="stMetricDelta"] svg,
         .st-key-ram_metric_high [data-testid="stMetricDelta"] svg {{
+            color: #ff3b30 !important;
             fill: #ff3b30 !important;
+        }}
+        .st-key-cpu_metric_high [data-testid="stMetricDelta"],
+        .st-key-ram_metric_high [data-testid="stMetricDelta"] {{
+            background: rgba(255, 59, 48, 0.12) !important;
+        }}
+
+        .st-key-cpu_metric_normal [data-testid="stMetricDelta"],
+        .st-key-ram_metric_normal [data-testid="stMetricDelta"],
+        .st-key-cpu_metric_normal [data-testid="stMetricDelta"] span,
+        .st-key-ram_metric_normal [data-testid="stMetricDelta"] span,
+        .st-key-cpu_metric_normal [data-testid="stMetricDelta"] svg,
+        .st-key-ram_metric_normal [data-testid="stMetricDelta"] svg {{
+            color: #16a34a !important;
+            fill: #16a34a !important;
+        }}
+        .st-key-cpu_metric_normal [data-testid="stMetricDelta"],
+        .st-key-ram_metric_normal [data-testid="stMetricDelta"] {{
+            background: rgba(22, 163, 74, 0.12) !important;
         }}
 
         .st-key-severity_metric_normal [data-testid="stMetricValue"],
@@ -736,16 +839,6 @@ def inject_custom_css() -> None:
             gap: 0.6rem;
         }}
 
-        .dash-header-left {{
-            display: flex;
-            align-items: center;
-            gap: 0.65rem;
-        }}
-
-        .dash-header-icon {{
-            font-size: 1.6rem;
-        }}
-
         .dash-header-title {{
             font-weight: 900;
             font-size: 1.35rem;
@@ -781,10 +874,10 @@ def inject_custom_css() -> None:
         }}
 
         [data-testid="stVerticalBlockBorderWrapper"] {{
-            background: rgba(255,255,255,0.94) !important;
-            border: 1px solid {border} !important;
-            border-radius: 18px !important;
-            box-shadow: 0 10px 26px rgba(249,115,22,0.10) !important;
+            background: transparent !important;
+            border: none !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
         }}
 
         .stats-panel-title {{
@@ -807,23 +900,6 @@ def inject_custom_css() -> None:
 
         .video-status-bar b {{
             color: {accent_dark};
-        }}
-
-        .st-key-webrtc_transport {{
-            height: 0 !important;
-            min-height: 0 !important;
-            max-height: 0 !important;
-            overflow: hidden !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            border: 0 !important;
-        }}
-        .st-key-webrtc_transport iframe {{
-            height: 1px !important;
-            min-height: 1px !important;
-            max-height: 1px !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
         }}
         </style>
         """,
@@ -889,7 +965,6 @@ def build_siren_wav_base64(
 
 
 def play_critical_alarm(is_critical: bool) -> None:
-    """Plays continuous siren sound while severity remains CRITICAL."""
     st.session_state.alarm_active = bool(is_critical) and st.session_state.sound_enabled
 
     if not st.session_state.alarm_active:
@@ -913,10 +988,12 @@ def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
         return
 
     now = time.time()
+
     if now - st.session_state.get("last_triggered_alert_ts", 0) <= 3.0:
         return
 
     st.session_state.last_triggered_alert_ts = now
+
     hazard_norm = str(hazard_title).strip().upper()
 
     if "FIRE" in hazard_norm:
@@ -971,16 +1048,18 @@ class SystemMonitor:
     @staticmethod
     def get_metrics() -> Dict[str, Any]:
         try:
-            cpu = float(psutil.cpu_percent(interval=0.01))
-            ram = float(psutil.virtual_memory().percent)
-
+            # Non-blocking CPU & RAM reading
+            cpu_val = float(psutil.cpu_percent(interval=None))
+            ram_val = float(psutil.virtual_memory().percent)
+            
             metrics = {
                 "time": datetime.now().strftime("%H:%M:%S"),
-                "cpu": cpu,
-                "ram": ram,
+                "cpu": cpu_val,
+                "ram": ram_val,
             }
 
-            st.session_state.metrics_history.append(metrics)
+            if "metrics_history" in st.session_state:
+                st.session_state.metrics_history.append(metrics)
             return metrics
         except Exception:
             return {
@@ -1007,7 +1086,6 @@ class ResourceGovernor:
         else:
             st.session_state.system_status = "HEALTHY"
             st.session_state.vlm_context = "ACTIVE"
-            st.session_state.last_public_notice = ""
 
     @staticmethod
     def recommended_token_budget() -> int:
@@ -1101,26 +1179,52 @@ def _get_gcp_service_account_info() -> Optional[dict]:
     return None
 
 
-@st.cache_resource(show_spinner=False)
+_GCP_CLIENT_LOCK = threading.Lock()
+_GCP_CLIENTS: Dict[str, Any] = {"storage": None, "firestore": None}
+
+
+def gcp_credentials_configured() -> bool:
+    return _get_gcp_service_account_info() is not None or bool(
+        os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+    )
+
+
 def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
+    """Return (storage_client, firestore_client).
+
+    Safe to call from background threads. Only successful clients are cached,
+    so a transient failure (no network yet, secrets not ready) is retried on
+    the next call instead of being remembered forever.
+    """
     if not GCP_AVAILABLE:
         return None, None
 
-    info = _get_gcp_service_account_info()
-    project_id = CONFIG["GCP_PROJECT_ID"]
+    with _GCP_CLIENT_LOCK:
+        if _GCP_CLIENTS["storage"] is not None and _GCP_CLIENTS["firestore"] is not None:
+            return _GCP_CLIENTS["storage"], _GCP_CLIENTS["firestore"]
 
-    try:
-        if info and gcp_service_account is not None:
-            credentials = gcp_service_account.Credentials.from_service_account_info(info)
-            project_id = info.get("project_id", project_id)
-            storage_client = storage.Client(credentials=credentials, project=project_id)
-            db_client = firestore.Client(credentials=credentials, project=project_id)
-        else:
-            storage_client = storage.Client(project=project_id)
-            db_client = firestore.Client(project=project_id)
+        info = _get_gcp_service_account_info()
+        project_id = CONFIG["GCP_PROJECT_ID"]
+
+        try:
+            if info and gcp_service_account is not None:
+                credentials = gcp_service_account.Credentials.from_service_account_info(info)
+                project_id = info.get("project_id", project_id)
+                storage_client = storage.Client(credentials=credentials, project=project_id)
+                # Same named Firestore database as the localhost build.
+                db_client = firestore.Client(
+                    credentials=credentials, project=project_id, database="cybervision"
+                )
+            else:
+                storage_client = storage.Client(project=project_id)
+                db_client = firestore.Client(project=project_id, database="cybervision")
+        except Exception as exc:
+            print(f"[GCP] client init failed: {exc!r}", flush=True)
+            return None, None
+
+        _GCP_CLIENTS["storage"] = storage_client
+        _GCP_CLIENTS["firestore"] = db_client
         return storage_client, db_client
-    except Exception:
-        return None, None
 
 
 STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
@@ -1270,36 +1374,20 @@ def render_browser_camera_widget(playing: bool) -> None:
 
 
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX (OPTIMIZED NON-BLOCKING)
+# MULTI-CAMERA HANDLING & 3x3 MATRIX
 # =============================================================================
-@st.cache_resource(show_spinner=False)
-def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
-    # One long-lived pool, reused across every fragment tick instead of
-    # being created and torn down every 100ms.
-    return ThreadPoolExecutor(max_workers=max(1, n_workers))
-
-
 @st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
     caps = {}
-
-    def _init_cam(args):
-        idx, src = args
+    for idx, src in enumerate(CONFIG["CAMERA_SOURCES"]):
         cap = cv2.VideoCapture(src)
         if cap.isOpened():
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, 320)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 240)
             cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            return idx, cap
+            caps[idx] = cap
         else:
             cap.release()
-            return idx, None
-
-    with ThreadPoolExecutor(max_workers=len(CONFIG["CAMERA_SOURCES"])) as executor:
-        results = executor.map(_init_cam, enumerate(CONFIG["CAMERA_SOURCES"]))
-        for idx, cap in results:
-            if cap is not None:
-                caps[idx] = cap
     return caps
 
 
@@ -1328,20 +1416,6 @@ def create_blank_tile(width: int = 320, height: int = 240, label: str = "NO CAME
     return frame
 
 
-_BLANK_TILE_CACHE: Dict[Tuple[int, int, str], np.ndarray] = {}
-
-
-def get_cached_blank_tile(width: int, height: int, label: str) -> np.ndarray:
-    # The "NO CAMERA" tile is identical every tick — draw it once and reuse
-    # the array instead of re-running cv2.putText/rectangle 10x/second.
-    key = (width, height, label)
-    tile = _BLANK_TILE_CACHE.get(key)
-    if tile is None:
-        tile = create_blank_tile(width, height, label)
-        _BLANK_TILE_CACHE[key] = tile
-    return tile.copy()
-
-
 def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, tile_h: int = 240) -> np.ndarray:
     tiles = []
     for idx in range(9):
@@ -1352,7 +1426,7 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
             cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (0, 255, 0), 1)
         else:
-            tile = get_cached_blank_tile(tile_w, tile_h, f"{cam_key}: NO CAMERA DETECTED")
+            tile = create_blank_tile(tile_w, tile_h, label=f"{cam_key}: NO CAMERA DETECTED")
         tiles.append(tile)
 
     row1 = np.hstack([tiles[0], tiles[1], tiles[2]])
@@ -1360,7 +1434,6 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
     row3 = np.hstack([tiles[6], tiles[7], tiles[8]])
 
     return np.vstack([row1, row2, row3])
-
 
 
 class VideoCaptureManager:
@@ -1395,27 +1468,15 @@ class VideoCaptureManager:
             st.session_state.last_error = "No camera streams open."
             return {}, None
 
-        def _read_cam(item):
-            idx, cap = item
-            if cap and cap.isOpened():
-                cap.grab()
-                ret, frame = cap.retrieve()
+        for idx, cap in list(caps.items()):
+            if cap.isOpened():
+                for _ in range(2):
+                    cap.grab()
+                ret, frame = cap.read()
                 if ret and frame is not None:
-                    return idx, frame
-            return idx, None
-
-        # Single camera: skip threading entirely, it's pure overhead.
-        if len(caps) == 1:
-            results = [_read_cam(item) for item in caps.items()]
-        else:
-            executor = _get_camera_read_executor(len(caps))
-            results = list(executor.map(_read_cam, caps.items()))
-
-        for idx, frame in results:
-            if frame is not None:
-                active_frames[idx] = frame
-                if primary_frame is None:
-                    primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
+                    active_frames[idx] = frame
+                    if primary_frame is None:
+                        primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
 
         return active_frames, primary_frame
 
@@ -1553,7 +1614,7 @@ class YOLOFireSmokeDetector:
     def available(self) -> bool:
         return self.model is not None
 
-    def detect(self, frame: np.ndarray) -> Dict[str, Any]:
+    def detect(self, frame: np.ndarray, imgsz: Optional[int] = None) -> Dict[str, Any]:
         empty = {
             "detected": False,
             "detections": [],
@@ -1568,7 +1629,7 @@ class YOLOFireSmokeDetector:
         try:
             results = self.model(
                 frame,
-                imgsz=CONFIG["YOLO_IMAGE_SIZE"],
+                imgsz=imgsz or CONFIG["YOLO_IMAGE_SIZE"],
                 conf=CONFIG["YOLO_CONFIDENCE"],
                 verbose=False,
                 device="cpu",
@@ -1612,51 +1673,8 @@ class YOLOFireSmokeDetector:
             }
 
         except Exception as exc:
-            empty["error"] = f"YOLO detection issue: {exc}"
+            st.session_state.last_error = f"YOLO detection issue: {exc}"
             return empty
-
-    def _async_worker(self, frame: np.ndarray) -> None:
-        result = self.detect(frame)
-        YOLO_RESULT_QUEUE.put(result)
-
-    def trigger_async_detect(self, frame: np.ndarray) -> None:
-        if st.session_state.get("yolo_detection_in_progress", False):
-            return
-        st.session_state.yolo_detection_in_progress = True
-        thread = threading.Thread(
-            target=self._async_worker,
-            args=(frame.copy(),),
-            daemon=True,
-        )
-        thread.start()
-
-    @staticmethod
-    def drain_worker_queue() -> None:
-        while not YOLO_RESULT_QUEUE.empty():
-            try:
-                result = YOLO_RESULT_QUEUE.get_nowait()
-            except queue.Empty:
-                break
-            st.session_state.yolo_detection_in_progress = False
-            st.session_state.yolo_detection = result
-            st.session_state.inference_count += 1
-            err = result.get("error")
-            if err:
-                st.session_state.last_error = err
-
-    @staticmethod
-    def draw_boxes_on_frame(frame: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
-        if not yolo_result or not yolo_result.get("detections"):
-            return frame
-
-        annotated = frame.copy()
-        for det in yolo_result["detections"]:
-            x1, y1, x2, y2 = det["box"]
-            label = f"{det['class']} {det['confidence']:.0%}"
-            cv2.rectangle(annotated, (x1, y1), (x2, y2), (0, 0, 255), 2)
-            cv2.putText(annotated, label, (x1, max(y1 - 8, 12)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-        return annotated
 
     @staticmethod
     def hazard_severity(yolo_result: Dict[str, Any]) -> str:
@@ -1668,10 +1686,21 @@ class YOLOFireSmokeDetector:
             class_name = detection["class"].lower()
             confidence = detection["confidence"]
 
+            # The YOLO confidence threshold is intentionally low so faint/early
+            # smoke is not discarded before verification. Severity remains
+            # confidence-aware so a weak detection does not automatically become critical.
             if "fire" in class_name:
-                candidate = "CRITICAL" if confidence >= 0.50 else "HIGH"
+                if confidence >= 0.60:
+                    candidate = "CRITICAL"
+                elif confidence >= 0.30:
+                    candidate = "HIGH"
+                else:
+                    candidate = "MEDIUM"
             elif "smoke" in class_name:
-                candidate = "HIGH" if confidence >= 0.30 else "MEDIUM"
+                if confidence >= 0.55:
+                    candidate = "HIGH"
+                else:
+                    candidate = "MEDIUM"
             else:
                 continue
 
@@ -1753,13 +1782,13 @@ class VisualFireSmokeDetector:
         elif fire_ratio >= 0.010:
             severity = "MEDIUM"
             keyword = "visual_fire_medium"
-        elif smoke_ratio >= 0.35:
+        elif smoke_ratio >= 0.30:
             severity = "CRITICAL"
             keyword = "visual_smoke_critical"
-        elif smoke_ratio >= 0.20:
+        elif smoke_ratio >= 0.15:
             severity = "HIGH"
             keyword = "visual_smoke_high"
-        elif smoke_ratio >= 0.10:
+        elif smoke_ratio >= 0.06:
             severity = "MEDIUM"
             keyword = "visual_smoke_medium"
         else:
@@ -1775,7 +1804,7 @@ class VisualFireSmokeDetector:
 
 
 # =============================================================================
-# OLLAMA VLM INFERENCE
+# OLLAMA VLM INFERENCE (THREAD-SAFE ASYNC NON-BLOCKING)
 # =============================================================================
 class VLMInference:
     @staticmethod
@@ -1788,13 +1817,13 @@ class VLMInference:
                     {
                         "role": "user",
                         "content": (
-                            "Analyze this camera frame for fire and smoke only. "
+                            "Analyze this camera frame specifically for FIRE and SMOKE. "
                             "Return exactly one category: NORMAL, MEDIUM, HIGH, or CRITICAL. "
-                            "Use NORMAL when there is no visible fire or smoke. "
-                            "Use MEDIUM only for light smoke or unclear early warning. "
-                            "Use HIGH for visible flame, burning object, or clear smoke. "
-                            "Use CRITICAL only for active fire, heavy smoke, visible flames, explosion, or immediate danger. "
-                            "Do not classify people, skin, red clothing, walls, posters, or warm lighting as fire. "
+                            "Treat faint, translucent, gray, white, or wispy smoke as valid smoke evidence when it forms a plume or cloud inconsistent with the background. "
+                            "Use MEDIUM for light/faint smoke or an early warning. "
+                            "Use HIGH for clear smoke, sustained smoke, burning material, or visible flame. "
+                            "Use CRITICAL for active flames, heavy smoke, rapid fire spread, explosion, or immediate danger. "
+                            "Do not require smoke to be dark or opaque. Do not classify people, skin, red clothing, walls, posters, steam-like background artifacts, or warm lighting as fire. "
                             "Start with the category, then one short reason."
                         ),
                         "images": [image_b64],
@@ -1822,6 +1851,10 @@ class VLMInference:
             return
 
         if st.session_state.get("vlm_in_progress", False):
+            return
+
+        # Halt background VLM operations if CPU or RAM is throttled
+        if st.session_state.get("throttle_active", False):
             return
 
         st.session_state.vlm_in_progress = True
@@ -1866,52 +1899,70 @@ def compile_yara_rules():
 
 class YARAVerifier:
     @staticmethod
-    def verify(vlm_text: str, visual_result: Dict[str, Any]) -> Dict[str, Any]:
+    def verify(
+        vlm_text: str,
+        visual_result: Dict[str, Any],
+        yolo_result: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        yolo_result = yolo_result or {}
         yara_severity = "NORMAL"
         matched_rule = "no_yara_match"
-        matched_source = "YARA_TEXT"
 
         if YARA_AVAILABLE and vlm_text:
             try:
                 rules = compile_yara_rules()
                 matches = rules.match(data=vlm_text.encode("utf-8", errors="ignore")) if rules else []
-
                 if matches:
-                    highest_score = -1
+                    best_score = -1
                     for match in matches:
-                        severity = match.meta.get("severity", "NORMAL")
+                        severity = str(match.meta.get("severity", "NORMAL")).upper()
                         score = SEVERITY_STYLE.get(severity, SEVERITY_STYLE["NORMAL"])["score"]
-
-                        if score > highest_score:
-                            highest_score = score
+                        if score > best_score:
+                            best_score = score
                             yara_severity = severity
                             matched_rule = match.rule
-
             except Exception:
                 yara_severity = "NORMAL"
                 matched_rule = "yara_verification_unavailable"
-        else:
-            matched_rule = "yara_not_installed" if not YARA_AVAILABLE else "no_vlm_text"
 
+        yolo_severity = YOLOFireSmokeDetector.hazard_severity(yolo_result)
         visual_severity = visual_result.get("visual_severity", "NORMAL")
+        yolo_score = SEVERITY_STYLE[yolo_severity]["score"]
         yara_score = SEVERITY_STYLE[yara_severity]["score"]
         visual_score = SEVERITY_STYLE[visual_severity]["score"]
 
-        if visual_score > yara_score:
-            final_severity = visual_severity
-            matched_source = "OPENCV_VISUAL_FALLBACK"
-            matched_keyword = visual_result.get("visual_keyword", "visual_detection")
-        else:
+        # YOLO is the primary fire/smoke detector. VLM + YARA verify the
+        # visual evidence; neither is allowed to erase a real YOLO detection.
+        final_severity = yolo_severity
+        matched_source = "YOLO" if yolo_score > 0 else "YARA"
+        matched_keyword = "yolo_detection" if yolo_score > 0 else matched_rule
+
+        if yara_score > SEVERITY_STYLE[final_severity]["score"]:
             final_severity = yara_severity
+            matched_source = "YOLO+YARA" if yolo_score > 0 else "YARA"
             matched_keyword = matched_rule
 
+        # Visual fallback can raise a result only when YOLO is unavailable.
+        if not yolo_result.get("model_available", False) and visual_score > SEVERITY_STYLE[final_severity]["score"]:
+            final_severity = visual_severity
+            matched_source = "VISUAL_FALLBACK"
+            matched_keyword = visual_result.get("visual_keyword", "visual_detection")
+
         is_hazard = final_severity != "NORMAL"
-        confidence = {
-            "NORMAL": 0.10,
-            "MEDIUM": 0.64,
-            "HIGH": 0.82,
-            "CRITICAL": 0.92,
-        }[final_severity]
+
+        # Use actual YOLO confidence where available rather than a fixed
+        # severity-to-confidence number. VLM/YARA-only results retain a
+        # conservative severity-derived certainty.
+        yolo_conf = float(yolo_result.get("highest_confidence", 0.0) or 0.0)
+        if yolo_score > 0 and yolo_conf > 0:
+            confidence = min(0.99, max(0.15, yolo_conf))
+        else:
+            confidence = {
+                "NORMAL": 0.10,
+                "MEDIUM": 0.64,
+                "HIGH": 0.82,
+                "CRITICAL": 0.92,
+            }[final_severity]
 
         return {
             "severity": final_severity,
@@ -1921,6 +1972,7 @@ class YARAVerifier:
             "matched_source": matched_source,
             "yara_severity": yara_severity,
             "visual_severity": visual_severity,
+            "yolo_severity": yolo_severity,
             "fire_ratio": visual_result.get("fire_ratio", 0.0),
             "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
             "yara_available": YARA_AVAILABLE,
@@ -1967,7 +2019,8 @@ def flush_pending_cloud_uploads() -> None:
         if client is None:
             return
         bucket = client.bucket(CONFIG["GCP_BUCKET"])
-    except Exception:
+    except Exception as exc:
+        print(f"[GCP sync] Storage client failed: {exc!r}", flush=True)
         return
 
     for filename in sorted(os.listdir(pending_dir)):
@@ -1995,7 +2048,8 @@ def flush_pending_cloud_uploads() -> None:
                 os.remove(meta_path)
 
             os.remove(image_path)
-        except Exception:
+        except Exception as exc:
+            print(f"[GCP sync] Upload of {filename} failed: {exc!r}", flush=True)
             continue
 
 
@@ -2008,7 +2062,7 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> No
             camera_id="CAM_01"
         )
 
-        if not st.session_state.cloud_sync_enabled or not GCP_AVAILABLE or storage is None:
+        if not GCP_AVAILABLE or storage is None:
             return
 
         if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
@@ -2057,6 +2111,9 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
     description = latest.get("description", "").lower()
     keyword = str(latest.get("matched_keyword", "")).lower()
 
+    if classes:
+        return "Fire Detected" if any("fire" in item for item in classes) else "Smoke Detected"
+
     has_fire = (
         any("fire" in item for item in classes)
         or "fire" in description
@@ -2087,79 +2144,78 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
 # =============================================================================
 def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     if frame is None or frame.size == 0:
-        default_alert = {
-            "timestamp": datetime.now().strftime("%H:%M:%S"),
-            "description": "NORMAL: Camera stream starting...",
-            "success": True,
-            "latency": 0.0,
-            "verified": False,
-            "yolo_detected": False,
-            "yolo_classes": "",
-            "yolo_confidence": 0.0,
-            "severity": "NORMAL",
-            "is_hazard": False,
-            "confidence": 0.0,
-            "matched_keyword": "none",
-            "matched_source": "SYSTEM",
-            "yara_severity": "NORMAL",
-            "visual_severity": "NORMAL",
-            "fire_ratio": 0.0,
-            "smoke_ratio": 0.0,
-            "yara_available": YARA_AVAILABLE,
-        }
-        play_critical_alarm(False)
-        st.session_state.yolo_severity = "NORMAL"
         return {
             "annotated_frame": frame,
-            "yolo": {"detected": False, "detections": []},
-            "alert": default_alert,
+            "yolo": {"detected": False, "detections": [], "model_available": False},
+            "alert": {
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "description": "NORMAL: Camera stream starting...",
+                "success": True, "latency": 0.0, "verified": False,
+                "yolo_detected": False, "yolo_classes": "", "yolo_confidence": 0.0,
+                "severity": "NORMAL", "is_hazard": False, "confidence": 0.0,
+                "matched_keyword": "none", "matched_source": "SYSTEM",
+                "yara_severity": "NORMAL", "visual_severity": "NORMAL",
+                "fire_ratio": 0.0, "smoke_ratio": 0.0, "yara_available": YARA_AVAILABLE,
+            },
         }
 
-    ResourceGovernor.check_resource_pressure()
     start_time = time.time()
+    metrics = SystemMonitor.get_metrics()
+    under_pressure = (
+        metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
+        or metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
+    )
+    st.session_state.throttle_active = under_pressure
+    st.session_state.system_status = "RESOURCE_PRESSURE" if under_pressure else "HEALTHY"
+    st.session_state.vlm_context = "REDUCED" if under_pressure else "ACTIVE"
 
     VLMInference.drain_worker_queue()
 
-    # 1. Primary Object Detection (YOLO)
+    # Under pressure, preserve the last valid result instead of repeatedly
+    # running expensive inference. The live camera itself remains responsive.
+    min_interval = CONFIG["THROTTLE_MIN_INTERVAL"] if under_pressure else 0.0
+    last_run = st.session_state.get("last_detection_run_ts", 0.0)
+    if under_pressure and (start_time - last_run) < min_interval:
+        cached_yolo = st.session_state.get("yolo_detection") or {
+            "detected": False, "detections": [], "model_available": False,
+            "annotated_frame": frame, "highest_confidence": 0.0, "classes": [],
+        }
+        cached_alert = dict(st.session_state.get("latest_detection") or {})
+        cached_alert["timestamp"] = datetime.now().strftime("%H:%M:%S")
+        cached_alert["throttled"] = True
+        return {
+            "annotated_frame": cached_yolo.get("annotated_frame", frame),
+            "yolo": cached_yolo,
+            "alert": cached_alert,
+        }
+
+    st.session_state.last_detection_run_ts = start_time
+    yolo_imgsz = CONFIG["THROTTLE_YOLO_IMAGE_SIZE"] if under_pressure else CONFIG["YOLO_IMAGE_SIZE"]
+
+    visual_result = VisualFireSmokeDetector.detect(frame)
+
     yolo_detector = st.session_state.get("yolo_detector")
     if yolo_detector is None:
         yolo_detector = YOLOFireSmokeDetector()
         st.session_state.yolo_detector = yolo_detector
 
-    yolo_detector.drain_worker_queue()
+    yolo_result = yolo_detector.detect(frame, imgsz=yolo_imgsz)
+    yolo_result["model_available"] = yolo_detector.available
+    st.session_state.yolo_detection = yolo_result
 
-    frame_number = st.session_state.frames_processed
-    run_yolo_now = (
-        st.session_state.get("yolo_detection") is None
-        or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"]) == 0
-    )
-
-    if run_yolo_now:
-        yolo_detector.trigger_async_detect(frame)
-
-    yolo_result = st.session_state.get("yolo_detection") or {
-        "detected": False, "detections": [], "highest_confidence": 0.0,
-        "classes": [], "annotated_frame": frame,
-    }
-
-    yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
+    yolo_severity = yolo_detector.hazard_severity(yolo_result)
     st.session_state.yolo_severity = yolo_severity
 
-    run_visual_now = (
-        st.session_state.get("last_visual_result") is None
-        or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"]) == 0
+    # Trigger Moondream when YOLO sees fire/smoke. If YOLO misses it, the
+    # visual smoke signal can also request verification. Periodic VLM checks
+    # are intentionally limited to avoid overwhelming the CPU-only laptop.
+    candidate_hazard = (
+        yolo_result.get("detected", False)
+        or visual_result.get("visual_severity", "NORMAL") != "NORMAL"
     )
-    if run_visual_now:
-        visual_result = VisualFireSmokeDetector.detect(frame)
-        st.session_state.last_visual_result = visual_result
-    else:
-        visual_result = st.session_state.last_visual_result
-
-    candidate_hazard = yolo_result.get("detected", False)
-    analyze_this_frame = (
-        candidate_hazard
-        and frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
-    )
+    frame_number = st.session_state.frames_processed
+    periodic_check = (frame_number % 30 == 0)
+    analyze_this_frame = candidate_hazard or periodic_check
 
     if analyze_this_frame:
         VLMInference.trigger_async_inference(frame)
@@ -2168,50 +2224,40 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     if not vlm_text:
         vlm_text = "NORMAL: Monitoring active."
 
-    verdict = YARAVerifier.verify(vlm_text, visual_result)
+    verdict = YARAVerifier.verify(vlm_text, visual_result, yolo_result)
 
     latency = time.time() - start_time
     st.session_state.latency_history.append(latency)
 
-    public_description = vlm_text
+    detection_text = "No YOLO detection"
     if yolo_result.get("detected"):
-        detection_text = ", ".join(f"{d['class']} {d['confidence']:.0%}" for d in yolo_result["detections"])
-        public_description = f"YOLO detected: {detection_text}. VLM: {vlm_text}"
+        detection_text = ", ".join(
+            f"{d['class']} {d['confidence']:.0%}"
+            for d in yolo_result.get("detections", [])
+        )
 
-    is_hazard = yolo_result.get("detected", False)
-    confidence = yolo_result.get("highest_confidence", 0.0) if is_hazard else 0.0
+    public_description = f"YOLO: {detection_text}. VLM: {vlm_text}"
 
     alert = {
         "timestamp": datetime.now().strftime("%H:%M:%S"),
         "description": public_description,
         "success": True,
         "latency": latency,
-        "verified": is_hazard,
-        "yolo_detected": is_hazard,
+        "verified": verdict["is_hazard"],
+        "yolo_detected": yolo_result.get("detected", False),
         "yolo_classes": ", ".join(yolo_result.get("classes", [])),
-        "yolo_confidence": confidence,
-        "severity": yolo_severity,
-        "is_hazard": is_hazard,
-        "confidence": confidence,
-        "matched_keyword": verdict.get("matched_keyword", "none"),
-        "matched_source": "YOLO_DETECTOR" if is_hazard else "SYSTEM",
-        "yara_severity": verdict.get("yara_severity", "NORMAL"),
-        "visual_severity": visual_result.get("visual_severity", "NORMAL"),
-        "fire_ratio": visual_result.get("fire_ratio", 0.0),
-        "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
-        "yara_available": YARA_AVAILABLE,
+        "yolo_confidence": yolo_result.get("highest_confidence", 0.0),
+        **verdict,
     }
 
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    if yolo_severity != "NORMAL":
-        hazard_title = determine_hazard_title(alert)
-        dispatch_hazard_alerts(yolo_severity, hazard_title)
+    hazard_title = determine_hazard_title(alert)
+    dispatch_hazard_alerts(alert["severity"], hazard_title)
+    play_critical_alarm(alert["severity"] == "CRITICAL")
 
-    play_critical_alarm(yolo_severity == "CRITICAL")
-
-    if is_hazard:
+    if verdict["is_hazard"]:
         upload_to_google_cloud_async(frame, alert)
 
     return {
@@ -2229,13 +2275,9 @@ def render_sidebar_profile() -> None:
 
     user_name = getattr(st.user, "name", None) or "Signed in"
     user_email = getattr(st.user, "email", "") or ""
-    user_picture = getattr(st.user, "picture", None)
 
-    if user_picture:
-        avatar_html = f'<img class="profile-avatar" src="{user_picture}" alt="avatar" />'
-    else:
-        initial = (user_name or "?")[:1].upper()
-        avatar_html = f'<div class="profile-avatar profile-avatar-fallback">{initial}</div>'
+    initial = (user_email[:1] if user_email else user_name[:1] or "?").upper()
+    avatar_html = f'<div class="profile-avatar profile-avatar-fallback">{initial}</div>'
 
     st.markdown(
         f"""
@@ -2284,8 +2326,35 @@ def render_login_page() -> None:
                 st.error(
                     "Google sign-in isn't configured yet. Add an [auth] / "
                     "[auth.google] section with your OAuth client credentials to "
-                    f".streamlit/secrets.toml (see secrets.toml.example). Details: {exc}"
+                    f".streamlit/secrets.toml. Details: {exc}"
                 )
+
+
+@st.fragment(run_every=3.0)
+def render_sidebar_status() -> None:
+    cam_running = st.session_state.camera_running
+    wifi_online = is_network_online()
+    cloud_sync = wifi_online and GCP_AVAILABLE and gcp_credentials_configured()
+
+    st.markdown(
+        f"""
+        <div class="status-footer">
+            <div class="status-row">
+                <span class="status-dot" style="background:{'#30d158' if cam_running else '#ff3b30'};"></span>
+                Camera {"running" if cam_running else "stopped"}
+            </div>
+            <div class="status-row">
+                <span class="status-dot" style="background:{'#30d158' if wifi_online else '#ffd60a'};"></span>
+                Network {"online" if wifi_online else "offline"}
+            </div>
+            <div class="status-row">
+                <span class="status-dot" style="background:{'#30d158' if cloud_sync else '#ffd60a'};"></span>
+                Data synced {"to cloud" if cloud_sync else "locally"}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 def render_sidebar_nav() -> None:
@@ -2303,26 +2372,10 @@ def render_sidebar_nav() -> None:
             unsafe_allow_html=True,
         )
 
-        cam_running = st.session_state.camera_running
-        wifi_online = is_wifi_connected()
-
-        st.markdown(
-            f"""
-            <div class="status-footer">
-                <div class="status-row">
-                    <span class="status-dot" style="background:{'#30d158' if cam_running else '#ff3b30'};"></span>
-                    Camera {"running" if cam_running else "stopped"}
-                </div>
-                <div class="status-row">
-                    <span class="status-dot" style="background:{'#30d158' if wifi_online else '#ffd60a'};"></span>
-                    Network {"online" if wifi_online else "offline"}
-                </div>
-            </div>
-            """,
-            unsafe_allow_html=True,
-        )
+        render_sidebar_status()
 
         st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
+
         st.markdown("<div class='nav-section-label'>Workspace</div>", unsafe_allow_html=True)
 
         nav_items = [
@@ -2348,8 +2401,31 @@ def render_sidebar_nav() -> None:
             render_sidebar_profile()
 
 
+@st.fragment(run_every=1.0)
+def _render_resources_live() -> None:
+    metrics = SystemMonitor.get_metrics()
+    cpu_high = metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
+    ram_high = metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
+    cpu_delta = ":material/error:" if cpu_high else ":material/check_circle:"
+    ram_delta = ":material/error:" if ram_high else ":material/check_circle:"
+
+    m1, m2 = st.columns(2)
+    with m1:
+        with st.container(key="cpu_metric_high" if cpu_high else "cpu_metric_normal"):
+            st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
+    with m2:
+        with st.container(key="ram_metric_high" if ram_high else "ram_metric_normal"):
+            st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
+
+    if st.session_state.latency_history:
+        avg_latency = sum(st.session_state.latency_history) / len(st.session_state.latency_history)
+        st.metric("Avg Latency", f"{avg_latency * 1000:.0f} ms")
+    else:
+        st.metric("Avg Latency", "—")
+
+
 def render_dashboard_settings_panel() -> None:
-    with st.container(border=True):
+    with st.container():
         st.markdown("<div class='stats-panel-title'>Server Setup</div>", unsafe_allow_html=True)
 
         st.session_state.sound_enabled = st.toggle(
@@ -2357,30 +2433,9 @@ def render_dashboard_settings_panel() -> None:
             value=st.session_state.sound_enabled,
         )
 
-        wifi_online = is_wifi_connected()
-        sync_label = (
-            "Data synced _to cloud_"
-            if (st.session_state.cloud_sync_enabled and wifi_online)
-            else "Data synced _locally_"
-        )
-        st.session_state.cloud_sync_enabled = st.toggle(
-            sync_label,
-            value=st.session_state.cloud_sync_enabled,
-        )
-
-        if st.session_state.cloud_sync_enabled:
-            if not GCP_AVAILABLE:
-                st.caption(":material/error: `google-cloud-firestore` / `google-cloud-storage` not installed.")
-            elif CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
-                st.caption(":material/warning: Set CONFIG[\"GCP_BUCKET\"] / GCP_PROJECT_ID in main.py.")
-            elif _get_gcp_service_account_info() is None:
-                st.caption(":material/warning: No GCP credentials found (secrets, env var, or key file).")
-            else:
-                st.caption(":material/check_circle: GCP credentials loaded.")
-
         timeout_option = st.selectbox(
             "Inference timeout target",
-            ["1.0s", "2.0s", "3.0s", "5.0s"],
+            ["1.0s", "2.0s", "3.0s", "4.0s", "5.0s"],
             index=1,
             key="inference_timeout_select"
         )
@@ -2389,28 +2444,7 @@ def render_dashboard_settings_panel() -> None:
         st.markdown("<div style='height: 0.3rem;'></div>", unsafe_allow_html=True)
         st.markdown("<div class='stats-panel-title'>Resources</div>", unsafe_allow_html=True)
 
-        metrics = SystemMonitor.get_metrics()
-        cpu_high = metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
-        ram_high = metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
-        cpu_delta = ":material/check_circle:" if metrics["cpu"] < 70 else ":material/warning:" if not cpu_high else ":material/error:"
-        ram_delta = ":material/check_circle:" if metrics["ram"] < 70 else ":material/warning:" if not ram_high else ":material/error:"
-
-        m1, m2 = st.columns(2)
-        with m1:
-            with st.container(key="cpu_metric_high" if cpu_high else "cpu_metric_normal"):
-                st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
-        with m2:
-            with st.container(key="ram_metric_high" if ram_high else "ram_metric_normal"):
-                st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
-
-        if st.session_state.latency_history:
-            avg_latency = sum(st.session_state.latency_history) / len(st.session_state.latency_history)
-            st.metric("Avg Latency", f"{avg_latency * 1000:.0f} ms")
-        else:
-            st.metric("Avg Latency", "—")
-
-        if st.session_state.last_error:
-            st.info("Model/YARA backend notice: Active fallback running.")
+        _render_resources_live()
 
         if not is_yolo_model_available():
             with st.expander(":material/error: YOLO not active — details", expanded=True):
@@ -2421,24 +2455,34 @@ def render_dashboard_settings_panel() -> None:
 # =============================================================================
 # DASHBOARD COMPONENTS
 # =============================================================================
+@st.fragment(run_every=1.0)
 def render_dashboard_header() -> None:
     cam_running = st.session_state.camera_running
     yolo_ready = is_yolo_model_available()
 
-    if cam_running and yolo_ready:
-        pill_text, pill_color = "YOLO ACTIVE", "#30d158"
+    # Dynamic CPU & RAM check directly at header render time
+    metrics = SystemMonitor.get_metrics()
+    is_throttled = (
+        metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
+        or metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
+        or st.session_state.get("throttle_active", False)
+    )
+
+    if cam_running and is_throttled:
+        pill_text, pill_color = "THROTTLED", "#ff3b30"
+    elif cam_running and yolo_ready:
+        pill_text, pill_color = "ACTIVE MODE", "#30d158"
     elif cam_running:
         pill_text, pill_color = "FALLBACK MODE", "#ffd60a"
     else:
-        pill_text, pill_color = "STANDBY", "#9ca3af"
+        pill_text, pill_color = "STANDBY", "#eab308"
 
     st.markdown(
         f"""
         <div class="dash-header">
-                <div>
-                    <div class="dash-header-title">Live Camera Feeds</div>
-                    <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
-                </div>
+            <div>
+                <div class="dash-header-title">Live Camera Feeds</div>
+                <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
             </div>
             <div class="status-pill-live" style="border-color:{pill_color}66; color:{pill_color};">
                 <span class="status-pill-dot" style="background:{pill_color};"></span>
@@ -2453,7 +2497,7 @@ def render_dashboard_header() -> None:
 def _render_live_stats_body() -> None:
     latest = st.session_state.get("latest_detection") or {}
 
-    severity = str(st.session_state.get("yolo_severity", "NORMAL")).upper()
+    severity = str((st.session_state.get("latest_detection") or {}).get("severity", st.session_state.get("yolo_severity", "NORMAL"))).upper()
     if severity not in SEVERITY_STYLE:
         severity = "NORMAL"
 
@@ -2461,7 +2505,7 @@ def _render_live_stats_body() -> None:
     hazards = sum(1 for item in st.session_state.alert_history if item["is_hazard"])
     confidence = (latest.get("confidence", 0) * 100 if latest else 0)
 
-    with st.container(border=True):
+    with st.container():
         st.markdown("<div class='stats-panel-title'>Active Monitoring</div>", unsafe_allow_html=True)
 
         r1c1, r1c2 = st.columns(2)
@@ -2476,7 +2520,7 @@ def _render_live_stats_body() -> None:
 
 
 def render_live_stats_panel() -> None:
-    refresh = 0.1 if st.session_state.get("camera_running") else None
+    refresh = 0.5 if st.session_state.get("camera_running") else None
     st.fragment(_render_live_stats_body, run_every=refresh)()
 
 
@@ -2510,68 +2554,76 @@ def render_resource_trend_preview() -> None:
 
 
 # =============================================================================
-# LIVE VIDEO STREAM (STABLE FULL-WIDTH 3x3 MATRIX)
+# LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
-@st.fragment(run_every=0.1)
-def live_camera_fragment(video_placeholder) -> None:
+def render_video_frame(video_placeholder, status_placeholder) -> None:
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
-        return
-
-    if st.session_state.get("_frame_processing_busy"):
-        return
-
-    st.session_state._frame_processing_busy = True
-    try:
-        active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
-
-        if primary_frame is None and not active_frames:
-            st.error(st.session_state.get("last_error") or "Camera unavailable.")
-            return
-
-        current_time = time.time()
-        last_time = st.session_state.get("last_frame_time", current_time)
-        fps = 1 / max(current_time - last_time, 0.001)
-
-        st.session_state.fps = fps
-        st.session_state.last_frame_time = current_time
-        st.session_state.frames_processed += 1
-
-        pipeline_result = run_detection_pipeline(primary_frame)
-
-        if 0 in active_frames and primary_frame is not None:
-            yolo_for_overlay = pipeline_result.get("yolo", {})
-            active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(
-                primary_frame, yolo_for_overlay
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+                use_container_width=True,
             )
+        return
 
-        grid_matrix = construct_3x3_grid(active_frames)
+    active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
-        severity = st.session_state.get("yolo_severity", "NORMAL")
-        yolo_result = pipeline_result.get("yolo", {})
-        yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
+    if primary_frame is None and not active_frames:
+        status_placeholder.info(st.session_state.get("last_error") or "Camera unavailable.")
+        return
 
-        hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
-        hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
+    current_time = time.time()
+    last_time = st.session_state.get("last_frame_time", current_time)
+    fps = 1 / max(current_time - last_time, 0.001)
 
-        overlay = grid_matrix.copy()
-        cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.50, grid_matrix, 0.50, 0, grid_matrix)
+    st.session_state.fps = fps
+    st.session_state.last_frame_time = current_time
+    st.session_state.frames_processed += 1
 
-        cv2.putText(grid_matrix, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
-        cv2.putText(grid_matrix, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+    pipeline_result = run_detection_pipeline(primary_frame)
 
-        grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
-        st.session_state.last_frame_rgb = grid_rgb
+    if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
+        active_frames[0] = pipeline_result["annotated_frame"]
 
-        # JPEG encodes far faster and more consistently than the default PNG,
-        # which was the main source of frame-to-frame timing jitter (glitch).
-        video_placeholder.image(
-            grid_rgb, channels="RGB", use_container_width=True, output_format="JPEG"
-        )
-    finally:
-        st.session_state._frame_processing_busy = False
+    grid_matrix = construct_3x3_grid(active_frames)
+
+    severity = st.session_state.get("yolo_severity", "NORMAL")
+
+    yolo_result = pipeline_result.get("yolo", {})
+    yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
+
+    hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
+    hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
+
+    overlay = grid_matrix.copy()
+    cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.50, grid_matrix, 0.50, 0, grid_matrix)
+
+    cv2.putText(grid_matrix, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+    cv2.putText(grid_matrix, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+
+    grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
+    st.session_state.last_frame_rgb = grid_rgb
+
+    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+
+    if not YOLO_AVAILABLE:
+        status_placeholder.warning("Ultralytics is not installed.")
+    elif not is_yolo_model_available():
+        status_placeholder.warning("YOLO model not found.")
+    elif yolo_result.get("detected"):
+        detections = ", ".join(f"{d['class']} ({d['confidence']:.0%})" for d in yolo_result.get("detections", []))
+        status_placeholder.warning(f"YOLO detection: {detections}")
+    else:
+        status_placeholder.success("Live camera monitoring active...")
+
+
+@st.fragment(run_every=0.75 if st.session_state.get("throttle_active") else 0.1)
+def live_camera_fragment(video_container, status_container):
+    render_video_frame(video_container, status_container)
 
 
 def render_video_feed() -> None:
@@ -2587,7 +2639,6 @@ def render_video_feed() -> None:
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.alarm_active = False
-            st.session_state.active_hazard_toast = None
 
             if st.session_state.get("yolo_detector") is None:
                 st.session_state.yolo_detector = YOLOFireSmokeDetector()
@@ -2599,7 +2650,6 @@ def render_video_feed() -> None:
             st.session_state.camera_running = False
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.alarm_active = False
-            st.session_state.active_hazard_toast = None
             release_camera()
             st.rerun()
 
@@ -2614,6 +2664,7 @@ def render_video_feed() -> None:
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
     video_placeholder = st.empty()
+    status_placeholder = st.empty()
 
     if not st.session_state.camera_running:
         if st.session_state.get("last_frame_rgb") is not None:
@@ -2623,10 +2674,9 @@ def render_video_feed() -> None:
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
                 use_container_width=True,
             )
-        st.info("Camera is stopped. Detection paused.")
         return
 
-    live_camera_fragment(video_placeholder)
+    live_camera_fragment(video_placeholder, status_placeholder)
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
@@ -2635,37 +2685,49 @@ def _build_forensic_display_df() -> Optional[pd.DataFrame]:
 
     df = pd.DataFrame(list(st.session_state.alert_history))
 
-    display_cols = [
-        "timestamp", "severity", "matched_source", "matched_keyword",
-        "yara_severity", "visual_severity", "confidence", "latency",
-        "fire_ratio", "smoke_ratio", "success", "description",
-        "yolo_detected", "yolo_classes", "yolo_confidence",
-    ]
+    rename_map = {
+        "timestamp": "Time Captured",
+        "severity": "Threat Level",
+        "description": "Summary",
+        "confidence": "Certainty",
+        "yolo_classes": "Objects Spotted",
+        "matched_source": "Detection Engine",
+        "latency": "Response Time (sec)",
+    }
 
-    display_df = df[display_cols].copy()
-    display_df["latency_ms"] = (display_df["latency"] * 1000).round(1)
-    display_df["confidence"] = ((display_df["confidence"] * 100).round(1).astype(str) + "%")
-    display_df = display_df.drop(columns=["latency"])
+    available_cols = [c for c in rename_map.keys() if c in df.columns]
+    display_df = df[available_cols].copy()
+
+    if "confidence" in display_df.columns:
+        display_df["confidence"] = (display_df["confidence"] * 100).round(0).astype(int).astype(str) + "%"
+
+    if "latency" in display_df.columns:
+        display_df["latency"] = display_df["latency"].round(2)
+
+    if "yolo_classes" in display_df.columns:
+        display_df["yolo_classes"] = display_df["yolo_classes"].replace("", "None detected")
+
+    display_df = display_df.rename(columns=rename_map)
     return display_df
 
 
 def render_data_logs_page() -> None:
     header_col, btn_col = st.columns([5, 1.3])
     with header_col:
-        st.markdown("### Data Logs")
-        st.markdown("<p class='muted'>Full forensic event history captured by the detection pipeline.</p>", unsafe_allow_html=True)
+        st.markdown("### Activity Logs")
+        st.markdown("<p class='muted'>Easy-to-read log of recent safety checks and detections.</p>", unsafe_allow_html=True)
     with btn_col:
         st.markdown("<div style='height: 1.7rem;'></div>", unsafe_allow_html=True)
-        if st.button("Reset logs", icon=":material/restart_alt:", use_container_width=True, key="reset_logs_btn"):
+        if st.button("Clear History", icon=":material/restart_alt:", use_container_width=True, key="reset_logs_btn"):
             st.session_state.alert_history.clear()
             st.session_state.latency_history.clear()
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
-            st.success("Logs reset.")
+            st.success("Log history cleared.")
 
     display_df = _build_forensic_display_df()
     if display_df is None:
-        st.info("No events logged yet.")
+        st.info("No monitoring events recorded yet.")
         return
 
     st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
@@ -2721,17 +2783,25 @@ def render_analytics_page() -> None:
     render_charts()
 
 
-def render_dashboard_page() -> None:
+@st.fragment(run_every=1.0)
+def render_system_load_banner() -> None:
     metrics = SystemMonitor.get_metrics()
-    if metrics["cpu"] > 90.0 or metrics["ram"] > 88.0:
-        st.error(f"Critical System Load! CPU: {metrics['cpu']}% | RAM: {metrics['ram']}%. System throttling.", icon=":material/error:")
+    if metrics["cpu"] >= CONFIG["CPU_THRESHOLD"] or metrics["ram"] >= CONFIG["RAM_THRESHOLD"]:
+        st.error(
+            f"Critical System Load! CPU: {metrics['cpu']:.1f}% | RAM: {metrics['ram']:.1f}%. System throttling.",
+            icon=":material/error:",
+        )
+
+
+def render_dashboard_page() -> None:
+    render_system_load_banner()
 
     render_dashboard_header()
 
     video_col, stats_col = st.columns([2.6, 1], gap="medium")
 
     with video_col:
-        with st.container(border=True):
+        with st.container():
             render_video_feed()
             render_video_status_bar()
 
@@ -2752,11 +2822,13 @@ def main() -> None:
     init_session_state()
 
     try:
-        logged_in = bool(getattr(st.user, "is_logged_in", False))
+        google_logged_in = bool(getattr(st.user, "is_logged_in", False))
     except Exception:
-        logged_in = False
+        google_logged_in = False
 
-    if not logged_in:
+    is_authenticated = google_logged_in or st.session_state.get("dev_authenticated", False)
+
+    if not is_authenticated:
         render_login_page()
         return
 
