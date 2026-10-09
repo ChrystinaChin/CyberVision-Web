@@ -2562,7 +2562,9 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
 
 
 @st.fragment(run_every=0.75 if st.session_state.get("throttle_active") else 0.1)
-def live_camera_fragment(video_container, status_container):
+def live_camera_fragment():
+    video_container = st.empty()
+    status_container = st.empty()
     render_video_frame(video_container, status_container)
 
 
@@ -2602,10 +2604,8 @@ def render_video_feed() -> None:
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
-    video_placeholder = st.empty()
-    status_placeholder = st.empty()
-
     if not st.session_state.camera_running:
+        video_placeholder = st.empty()
         if st.session_state.get("last_frame_rgb") is not None:
             video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
         else:
@@ -2615,7 +2615,7 @@ def render_video_feed() -> None:
             )
         return
 
-    live_camera_fragment(video_placeholder, status_placeholder)
+    live_camera_fragment()
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
@@ -2761,10 +2761,8 @@ def main() -> None:
     init_session_state()
 
     # Verify if user is logged in via Streamlit OAuth
-    google_logged_in = False
     try:
-        if hasattr(st, "user") and st.user:
-            google_logged_in = bool(getattr(st.user, "email", None) or getattr(st.user, "name", None) or st.user)
+        google_logged_in = bool(getattr(st.user, "is_logged_in", False))
     except Exception:
         google_logged_in = False
 
