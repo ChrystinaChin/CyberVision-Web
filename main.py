@@ -2061,4 +2061,738 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
 
     has_fire = (
         any("fire" in item for item in classes)
-        or "fire" in description)
+        or "fire" in description
+        or "fire" in keyword
+        or latest.get("fire_ratio", 0) > 0.010
+    )
+
+    has_smoke = (
+        any("smoke" in item for item in classes)
+        or "smoke" in description
+        or "smoke" in keyword
+        or latest.get("smoke_ratio", 0) > 0.10
+    )
+
+    if has_fire:
+        return "Fire Detected"
+    if has_smoke:
+        return "Smoke Detected"
+
+    return "Smoke Detected"
+
+
+# =============================================================================
+# DETECTION PIPELINE
+# =============================================================================
+def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
+    if frame is None or frame.size == 0:
+        return {
+            "annotated_frame": frame,
+            "yolo": {"detected": False, "detections": [], "model_available": False},
+            "alert": {
+                "timestamp": datetime.now().strftime("%H:%M:%S"),
+                "description": "NORMAL: Camera stream starting...",
+                "success": True, "latency": 0.0, "verified": False,
+                "yolo_detected": False, "yolo_classes": "", "yolo_confidence": 0.0,
+                "severity": "NORMAL", "is_hazard": False, "confidence": 0.0,
+                "matched_keyword": "none", "matched_source": "SYSTEM",
+                "yara_severity": "NORMAL", "visual_severity": "NORMAL",
+                "fire_ratio": 0.0, "smoke_ratio": 0.0, "yara_available": YARA_AVAILABLE,
+            },
+        }
+
+    start_time = time.time()
+    metrics = SystemMonitor.get_metrics()
+    under_pressure = (
+        metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
+        or metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
+    )
+    st.session_state.throttle_active = under_pressure
+    st.session_state.system_status = "RESOURCE_PRESSURE" if under_pressure else "HEALTHY"
+    st.session_state.vlm_context = "REDUCED" if under_pressure else "ACTIVE"
+
+    VLMInference.drain_worker_queue()
+
+    min_interval = CONFIG["THROTTLE_MIN_INTERVAL"] if under_pressure else 0.0
+    last_run = st.session_state.get("last_detection_run_ts", 0.0)
+    if under_pressure and (start_time - last_run) < min_interval:
+        cached_yolo = st.session_state.get("yolo_detection") or {
+            "detected": False, "detections": [], "model_available": False,
+            "annotated_frame": frame, "highest_confidence": 0.0, "classes": [],
+        }
+        cached_alert = dict(st.session_state.get("latest_detection") or {})
+        cached_alert["timestamp"] = datetime.now().strftime("%H:%M:%S")
+        cached_alert["throttled"] = True
+        return {
+            "annotated_frame": cached_yolo.get("annotated_frame", frame),
+            "yolo": cached_yolo,
+            "alert": cached_alert,
+        }
+
+    st.session_state.last_detection_run_ts = start_time
+    yolo_imgsz = CONFIG["THROTTLE_YOLO_IMAGE_SIZE"] if under_pressure else CONFIG["YOLO_IMAGE_SIZE"]
+
+    visual_result = VisualFireSmokeDetector.detect(frame)
+
+    yolo_detector = st.session_state.get("yolo_detector")
+    if yolo_detector is None:
+        yolo_detector = YOLOFireSmokeDetector()
+        st.session_state.yolo_detector = yolo_detector
+
+    yolo_result = yolo_detector.detect(frame, imgsz=yolo_imgsz)
+    yolo_result["model_available"] = yolo_detector.available
+    st.session_state.yolo_detection = yolo_result
+
+    yolo_severity = yolo_detector.hazard_severity(yolo_result)
+    st.session_state.yolo_severity = yolo_severity
+
+    candidate_hazard = (
+        yolo_result.get("detected", False)
+        or visual_result.get("visual_severity", "NORMAL") != "NORMAL"
+    )
+    frame_number = st.session_state.frames_processed
+    periodic_check = (frame_number % 30 == 0)
+    analyze_this_frame = candidate_hazard or periodic_check
+
+    if analyze_this_frame:
+        VLMInference.trigger_async_inference(frame)
+
+    vlm_text = st.session_state.get("latest_vlm_text", "")
+    if not vlm_text:
+        vlm_text = "NORMAL: Monitoring active."
+
+    verdict = YARAVerifier.verify(vlm_text, visual_result, yolo_result)
+
+    latency = time.time() - start_time
+    st.session_state.latency_history.append(latency)
+
+    detection_text = "No YOLO detection"
+    if yolo_result.get("detected"):
+        detection_text = ", ".join(
+            f"{d['class']} {d['confidence']:.0%}"
+            for d in yolo_result.get("detections", [])
+        )
+
+    public_description = f"YOLO: {detection_text}. VLM: {vlm_text}"
+
+    alert = {
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "description": public_description,
+        "success": True,
+        "latency": latency,
+        "verified": verdict["is_hazard"],
+        "yolo_detected": yolo_result.get("detected", False),
+        "yolo_classes": ", ".join(yolo_result.get("classes", [])),
+        "yolo_confidence": yolo_result.get("highest_confidence", 0.0),
+        **verdict,
+    }
+
+    st.session_state.alert_history.append(alert)
+    st.session_state.latest_detection = alert
+
+    hazard_title = determine_hazard_title(alert)
+    dispatch_hazard_alerts(alert["severity"], hazard_title)
+    play_critical_alarm(alert["severity"] == "CRITICAL")
+
+    if verdict["is_hazard"]:
+        upload_to_google_cloud_async(frame, alert)
+
+    return {
+        "annotated_frame": yolo_result.get("annotated_frame", frame),
+        "yolo": yolo_result,
+        "alert": alert,
+    }
+
+
+# =============================================================================
+# SIDEBAR
+# =============================================================================
+def render_sidebar_profile() -> None:
+    st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
+
+    user_name = "Signed in"
+    user_email = ""
+
+    if hasattr(st, "user") and st.user:
+        user_name = getattr(st.user, "name", None) or getattr(st.user, "email", None) or "Signed in"
+        user_email = getattr(st.user, "email", "") or ""
+
+    initial = (user_email[:1] if user_email else user_name[:1] or "?").upper()
+    avatar_html = f'<div class="profile-avatar profile-avatar-fallback">{initial}</div>'
+
+    st.markdown(
+        f"""
+        <div class="profile-card">
+            {avatar_html}
+            <div class="profile-text">
+                <div class="profile-name">{user_name}</div>
+                <div class="profile-email">{user_email}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if st.button("Log out", icon=":material/logout:", use_container_width=True, key="logout_btn"):
+        st.logout()
+
+
+def render_login_page() -> None:
+    inject_custom_css()
+
+    st.markdown("<div style='height: 12vh;'></div>", unsafe_allow_html=True)
+    _, mid, _ = st.columns([1, 1.3, 1])
+
+    with mid:
+        st.markdown(
+            """
+            <div style="text-align:center;">
+                <div style="font-size:2.6rem;">🔥</div>
+                <div style="font-weight:900; font-size:1.5rem; color:#c2410c; margin-top:0.2rem;">CyberVision</div>
+                <div style="font-size:0.7rem; color:#6b7280; font-weight:700; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:1.4rem;">
+                    Edge Fire &amp; Smoke AI
+                </div>
+                <p style="color:#6b7280; font-size:0.9rem; margin-bottom:1.4rem;">
+                    Sign in to access the live monitoring dashboard.
+                </p>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        if st.button("Sign in with Google", icon=":material/login:", use_container_width=True, type="primary"):
+            try:
+                st.login("google")
+            except Exception as exc:
+                st.error(
+                    "Google sign-in isn't configured yet. Add an [auth] / "
+                    "[auth.google] section with your OAuth client credentials to "
+                    f".streamlit/secrets.toml. Details: {exc}"
+                )
+
+
+@st.fragment(run_every=3.0)
+def render_sidebar_status() -> None:
+    cam_running = st.session_state.camera_running
+    wifi_online = is_network_online()
+    cloud_sync = wifi_online and GCP_AVAILABLE and gcp_credentials_configured()
+
+    st.markdown(
+        f"""
+        <div class="status-footer">
+            <div class="status-row">
+                <span class="status-dot" style="background:{'#30d158' if cam_running else '#ff3b30'};"></span>
+                Camera {"running" if cam_running else "stopped"}
+            </div>
+            <div class="status-row">
+                <span class="status-dot" style="background:{'#30d158' if wifi_online else '#ffd60a'};"></span>
+                Network {"online" if wifi_online else "offline"}
+            </div>
+            <div class="status-row">
+                <span class="status-dot" style="background:{'#30d158' if cloud_sync else '#ffd60a'};"></span>
+                Data synced {"to cloud" if cloud_sync else "locally"}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_sidebar_nav() -> None:
+    with st.sidebar:
+        st.markdown(
+            """
+            <div class="brand-block">
+                <div class="brand-icon">🔥</div>
+                <div>
+                    <div class="brand-name">CyberVision</div>
+                    <div class="brand-subtitle">Edge Fire &amp; Smoke AI</div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+        render_sidebar_status()
+
+        st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
+
+        st.markdown("<div class='nav-section-label'>Workspace</div>", unsafe_allow_html=True)
+
+        nav_items = [
+            ("Dashboard", "dashboard"),
+            ("Analytics", "bar_chart"),
+            ("Data Logs", "table_chart"),
+            ("Export Reports", "description"),
+        ]
+
+        for label, icon_name in nav_items:
+            is_active = st.session_state.active_page == label
+            if st.button(
+                label,
+                icon=f":material/{icon_name}:",
+                key=f"nav_{label.replace(' ', '_').lower()}",
+                use_container_width=True,
+                type="primary" if is_active else "secondary",
+            ):
+                st.session_state.active_page = label
+                st.rerun()
+
+        with st.container(key="sidebar_bottom_block"):
+            render_sidebar_profile()
+
+
+@st.fragment(run_every=1.0)
+def _render_resources_live() -> None:
+    metrics = SystemMonitor.get_metrics()
+    cpu_high = metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
+    ram_high = metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
+    cpu_delta = ":material/error:" if cpu_high else ":material/check_circle:"
+    ram_delta = ":material/error:" if ram_high else ":material/check_circle:"
+
+    m1, m2 = st.columns(2)
+    with m1:
+        with st.container(key="cpu_metric_high" if cpu_high else "cpu_metric_normal"):
+            st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
+    with m2:
+        with st.container(key="ram_metric_high" if ram_high else "ram_metric_normal"):
+            st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
+
+    if st.session_state.latency_history:
+        avg_latency = sum(st.session_state.latency_history) / len(st.session_state.latency_history)
+        st.metric("Avg Latency", f"{avg_latency * 1000:.0f} ms")
+    else:
+        st.metric("Avg Latency", "—")
+
+
+def render_dashboard_settings_panel() -> None:
+    with st.container():
+        st.markdown("<div class='stats-panel-title'>Server Setup</div>", unsafe_allow_html=True)
+
+        st.session_state.sound_enabled = st.toggle(
+            "Alert sound",
+            value=st.session_state.sound_enabled,
+        )
+
+        timeout_option = st.selectbox(
+            "Inference timeout target",
+            ["1.0s", "2.0s", "3.0s", "4.0s", "5.0s"],
+            index=1,
+            key="inference_timeout_select"
+        )
+        CONFIG["INFERENCE_TIMEOUT"] = float(timeout_option.replace("s", ""))
+
+        st.markdown("<div style='height: 0.3rem;'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='stats-panel-title'>Resources</div>", unsafe_allow_html=True)
+
+        _render_resources_live()
+
+        if not is_yolo_model_available():
+            with st.expander(":material/error: YOLO not active — details", expanded=True):
+                for label, value in get_yolo_debug_info().items():
+                    st.text(f"{label}: {value}")
+
+
+# =============================================================================
+# DASHBOARD COMPONENTS
+# =============================================================================
+@st.fragment(run_every=1.0)
+def render_dashboard_header() -> None:
+    cam_running = st.session_state.camera_running
+    yolo_ready = is_yolo_model_available()
+
+    metrics = SystemMonitor.get_metrics()
+    is_throttled = (
+        metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
+        or metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
+        or st.session_state.get("throttle_active", False)
+    )
+
+    if cam_running and is_throttled:
+        pill_text, pill_color = "THROTTLED", "#ff3b30"
+    elif cam_running and yolo_ready:
+        pill_text, pill_color = "ACTIVE MODE", "#30d158"
+    elif cam_running:
+        pill_text, pill_color = "FALLBACK MODE", "#ffd60a"
+    else:
+        pill_text, pill_color = "STANDBY", "#eab308"
+
+    st.markdown(
+        f"""
+        <div class="dash-header">
+            <div>
+                <div class="dash-header-title">Live Camera Feeds</div>
+                <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
+            </div>
+            <div class="status-pill-live" style="border-color:{pill_color}66; color:{pill_color};">
+                <span class="status-pill-dot" style="background:{pill_color};"></span>
+                {pill_text}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_live_stats_body() -> None:
+    latest = st.session_state.get("latest_detection") or {}
+
+    severity = str((st.session_state.get("latest_detection") or {}).get("severity", st.session_state.get("yolo_severity", "NORMAL"))).upper()
+    if severity not in SEVERITY_STYLE:
+        severity = "NORMAL"
+
+    total = len(st.session_state.alert_history)
+    hazards = sum(1 for item in st.session_state.alert_history if item["is_hazard"])
+    confidence = (latest.get("confidence", 0) * 100 if latest else 0)
+
+    with st.container():
+        st.markdown("<div class='stats-panel-title'>Active Monitoring</div>", unsafe_allow_html=True)
+
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            with st.container(key=f"severity_metric_{severity.lower()}"):
+                st.metric("Severity", severity)
+        r1c2.metric("Confidence", f"{confidence:.0f}%")
+
+        r2c1, r2c2 = st.columns(2)
+        r2c1.metric("Frames", st.session_state.frames_processed)
+        r2c2.metric("Hazards", hazards, f"of {total}")
+
+
+def render_live_stats_panel() -> None:
+    refresh = 0.5 if st.session_state.get("camera_running") else None
+    st.fragment(_render_live_stats_body, run_every=refresh)()
+
+
+def render_video_status_bar() -> None:
+    fps = st.session_state.get("fps", 0.0)
+    avg_latency = (
+        sum(st.session_state.latency_history) / len(st.session_state.latency_history)
+        if st.session_state.latency_history else 0.0
+    )
+    resolution = f"{CONFIG['FRAME_WIDTH']}x{CONFIG['FRAME_HEIGHT']}"
+
+    st.markdown(
+        f"""
+        <div class="video-status-bar muted">
+            <span>RESOLUTION: <b>{resolution}</b></span>
+            <span>INFERENCE: <b>{avg_latency * 1000:.0f} ms</b></span>
+            <span>FPS: <b>{fps:.1f}</b></span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def render_resource_trend_preview() -> None:
+    metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
+    if metrics_df.empty:
+        st.info("No resource metrics yet.")
+        return
+    metrics_df = metrics_df.set_index("time")
+    st.line_chart(metrics_df[["cpu", "ram"]], height=180)
+
+
+# =============================================================================
+# LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
+# =============================================================================
+def render_video_frame(video_placeholder, status_placeholder) -> None:
+    render_custom_hazard_toast()
+
+    if not st.session_state.get("camera_running", False):
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+                use_container_width=True,
+            )
+        return
+
+    active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
+
+    if primary_frame is None and not active_frames:
+        status_placeholder.info(st.session_state.get("last_error") or "Camera unavailable.")
+        return
+
+    current_time = time.time()
+    last_time = st.session_state.get("last_frame_time", current_time)
+    fps = 1 / max(current_time - last_time, 0.001)
+
+    st.session_state.fps = fps
+    st.session_state.last_frame_time = current_time
+    st.session_state.frames_processed += 1
+
+    pipeline_result = run_detection_pipeline(primary_frame)
+
+    if 0 in active_frames and pipeline_result.get("annotated_frame") is not None:
+        active_frames[0] = pipeline_result["annotated_frame"]
+
+    grid_matrix = construct_3x3_grid(active_frames)
+
+    severity = st.session_state.get("yolo_severity", "NORMAL")
+
+    yolo_result = pipeline_result.get("yolo", {})
+    yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
+
+    hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
+    hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
+
+    overlay = grid_matrix.copy()
+    cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
+    cv2.addWeighted(overlay, 0.50, grid_matrix, 0.50, 0, grid_matrix)
+
+    cv2.putText(grid_matrix, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+    cv2.putText(grid_matrix, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+
+    grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
+    st.session_state.last_frame_rgb = grid_rgb
+
+    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+
+    if not YOLO_AVAILABLE:
+        status_placeholder.warning("Ultralytics is not installed.")
+    elif not is_yolo_model_available():
+        status_placeholder.warning("YOLO model not found.")
+    elif yolo_result.get("detected"):
+        detections = ", ".join(f"{d['class']} ({d['confidence']:.0%})" for d in yolo_result.get("detections", []))
+        status_placeholder.warning(f"YOLO detection: {detections}")
+    else:
+        status_placeholder.success("Live camera monitoring active...")
+
+
+@st.fragment(run_every=0.75 if st.session_state.get("throttle_active") else 0.1)
+def live_camera_fragment(video_container, status_container):
+    render_video_frame(video_container, status_container)
+
+
+def render_video_feed() -> None:
+    header_col, btn_col1, btn_col2 = st.columns([6, 1, 1])
+
+    with btn_col1:
+        if st.button("Start", icon=":material/play_arrow:", use_container_width=True, disabled=st.session_state.camera_running, key="start_cam_btn"):
+            st.session_state.camera_running = True
+            st.session_state.last_error = ""
+            st.session_state.last_vlm_candidate_frame = None
+            st.session_state.latest_vlm_text = ""
+            st.session_state.last_frame_time = time.time()
+            st.session_state.latest_detection = None
+            st.session_state.yolo_severity = "NORMAL"
+            st.session_state.alarm_active = False
+
+            if st.session_state.get("yolo_detector") is None:
+                st.session_state.yolo_detector = YOLOFireSmokeDetector()
+
+            st.rerun()
+
+    with btn_col2:
+        if st.button("Stop", icon=":material/stop:", use_container_width=True, disabled=not st.session_state.camera_running, key="stop_cam_btn"):
+            st.session_state.camera_running = False
+            st.session_state.yolo_severity = "NORMAL"
+            st.session_state.alarm_active = False
+            release_camera()
+            st.rerun()
+
+    if st.session_state.get("webrtc_unavailable_on_cloud"):
+        st.error(
+            "This deployment has no local camera device, and the browser-camera "
+            "(streamlit-webrtc) packages failed to load."
+        )
+
+    if st.session_state.get("use_webrtc"):
+        render_browser_camera_widget(playing=st.session_state.camera_running)
+
+    video_placeholder = st.empty()
+    status_placeholder = st.empty()
+
+    if not st.session_state.camera_running:
+        if st.session_state.get("last_frame_rgb") is not None:
+            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+        else:
+            video_placeholder.image(
+                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+                use_container_width=True,
+            )
+        return
+
+    live_camera_fragment(video_placeholder, status_placeholder)
+
+
+def _build_forensic_display_df() -> Optional[pd.DataFrame]:
+    if not st.session_state.alert_history:
+        return None
+
+    df = pd.DataFrame(list(st.session_state.alert_history))
+
+    rename_map = {
+        "timestamp": "Time Captured",
+        "severity": "Threat Level",
+        "description": "Summary",
+        "confidence": "Certainty",
+        "yolo_classes": "Objects Spotted",
+        "matched_source": "Detection Engine",
+        "latency": "Response Time (sec)",
+    }
+
+    available_cols = [c for c in rename_map.keys() if c in df.columns]
+    display_df = df[available_cols].copy()
+
+    if "confidence" in display_df.columns:
+        display_df["confidence"] = (display_df["confidence"] * 100).round(0).astype(int).astype(str) + "%"
+
+    if "latency" in display_df.columns:
+        display_df["latency"] = display_df["latency"].round(2)
+
+    if "yolo_classes" in display_df.columns:
+        display_df["yolo_classes"] = display_df["yolo_classes"].replace("", "None detected")
+
+    display_df = display_df.rename(columns=rename_map)
+    return display_df
+
+
+def render_data_logs_page() -> None:
+    header_col, btn_col = st.columns([5, 1.3])
+    with header_col:
+        st.markdown("### Activity Logs")
+        st.markdown("<p class='muted'>Easy-to-read log of recent safety checks and detections.</p>", unsafe_allow_html=True)
+    with btn_col:
+        st.markdown("<div style='height: 1.7rem;'></div>", unsafe_allow_html=True)
+        if st.button("Clear History", icon=":material/restart_alt:", use_container_width=True, key="reset_logs_btn"):
+            st.session_state.alert_history.clear()
+            st.session_state.latency_history.clear()
+            st.session_state.latest_detection = None
+            st.session_state.yolo_severity = "NORMAL"
+            st.success("Log history cleared.")
+
+    display_df = _build_forensic_display_df()
+    if display_df is None:
+        st.info("No monitoring events recorded yet.")
+        return
+
+    st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
+
+
+def render_export_reports_page() -> None:
+    st.markdown("### Export Reports")
+    st.markdown("<p class='muted'>Download the forensic alert log for offline analysis or auditing.</p>", unsafe_allow_html=True)
+
+    display_df = _build_forensic_display_df()
+    if display_df is None:
+        st.info("No events logged yet — nothing to export.")
+        return
+
+    st.metric("Events ready to export", len(display_df))
+
+    st.download_button(
+        "Download alerts log CSV",
+        icon=":material/download:",
+        data=display_df.to_csv(index=False).encode("utf-8"),
+        file_name=f"cybervision_forensic_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+        mime="text/csv",
+        use_container_width=True,
+        key="download_csv_btn"
+    )
+
+
+def render_charts() -> None:
+    c1, c2 = st.columns(2)
+    metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
+
+    if not metrics_df.empty:
+        metrics_df = metrics_df.set_index("time")
+        with c1:
+            st.markdown("#### CPU/RAM Usage")
+            st.line_chart(metrics_df[["cpu", "ram"]])
+    else:
+        c1.info("No resource metrics yet.")
+
+    if st.session_state.alert_history:
+        alert_df = pd.DataFrame(list(st.session_state.alert_history))
+        severity_counts = alert_df["severity"].value_counts().reindex(["NORMAL", "MEDIUM", "HIGH", "CRITICAL"]).fillna(0)
+        with c2:
+            st.markdown("#### Severity Distribution")
+            st.bar_chart(severity_counts)
+    else:
+        c2.info("No alert statistics yet.")
+
+
+def render_analytics_page() -> None:
+    st.markdown("### Analytics")
+    st.markdown("<p class='muted'>Resource usage trends and hazard severity distribution.</p>", unsafe_allow_html=True)
+    render_charts()
+
+
+@st.fragment(run_every=1.0)
+def render_system_load_banner() -> None:
+    metrics = SystemMonitor.get_metrics()
+    if metrics["cpu"] >= CONFIG["CPU_THRESHOLD"] or metrics["ram"] >= CONFIG["RAM_THRESHOLD"]:
+        st.error(
+            f"Critical System Load! CPU: {metrics['cpu']:.1f}% | RAM: {metrics['ram']:.1f}%. System throttling.",
+            icon=":material/error:",
+        )
+
+
+def render_dashboard_page() -> None:
+    render_system_load_banner()
+
+    render_dashboard_header()
+
+    video_col, stats_col = st.columns([2.6, 1], gap="medium")
+
+    with video_col:
+        with st.container():
+            render_video_feed()
+            render_video_status_bar()
+
+    with stats_col:
+        render_live_stats_panel()
+        st.markdown("<div style='height: 0.6rem;'></div>", unsafe_allow_html=True)
+        render_dashboard_settings_panel()
+
+    st.markdown("<div style='height: 0.7rem;'></div>", unsafe_allow_html=True)
+    st.markdown("#### Live Trends")
+    render_resource_trend_preview()
+
+
+# =============================================================================
+# MAIN
+# =============================================================================
+def main() -> None:
+    init_session_state()
+
+    # Verify if user is logged in via Streamlit OAuth
+    google_logged_in = False
+    try:
+        if hasattr(st, "user") and st.user:
+            google_logged_in = bool(getattr(st.user, "email", None) or getattr(st.user, "name", None) or st.user)
+    except Exception:
+        google_logged_in = False
+
+    is_authenticated = google_logged_in or st.session_state.get("dev_authenticated", False)
+
+    if not is_authenticated:
+        render_login_page()
+        return
+
+    start_sync_thread()
+    inject_custom_css()
+
+    render_sidebar_nav()
+
+    page = st.session_state.active_page
+
+    if page == "Dashboard":
+        render_dashboard_page()
+    elif page == "Analytics":
+        render_analytics_page()
+    elif page == "Data Logs":
+        render_data_logs_page()
+    elif page == "Export Reports":
+        render_export_reports_page()
+    else:
+        st.session_state.active_page = "Dashboard"
+        render_dashboard_page()
+
+
+if __name__ == "__main__":
+    main()
