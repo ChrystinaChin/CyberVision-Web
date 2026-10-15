@@ -2436,7 +2436,7 @@ def render_dashboard_header() -> None:
         f"""
         <div class="dash-header">
                 <div>
-                    <div class="dash-header-title">Live Camera Feeds</div>
+                    <div class="dash-header-title">Live Feeds</div>
                     <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
                 </div>
             </div>
