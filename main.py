@@ -188,13 +188,28 @@ def save_event_locally(timestamp: float, severity: str, description: str, camera
         conn.commit()
 
 
-def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: int = 2) -> bool:
+_WIFI_CHECK_CACHE: Dict[str, Any] = {"checked_at": 0.0, "online": False}
+_WIFI_CHECK_TTL_SECONDS = 15.0
+
+
+def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: float = 1.0) -> bool:
+    # Cached for a few seconds: this is called on every rerun (sidebar, settings
+    # panel, sync thread). The old version blocked up to 2s per call, leaked an
+    # unclosed socket each time, and set a process-wide default socket timeout
+    # that affected every other network call (including the Google login flow).
+    now = time.time()
+    if now - _WIFI_CHECK_CACHE["checked_at"] < _WIFI_CHECK_TTL_SECONDS:
+        return bool(_WIFI_CHECK_CACHE["online"])
+
     try:
-        socket.setdefaulttimeout(timeout)
-        socket.socket(socket.AF_INET, socket.SOCK_STREAM).connect((host, port))
-        return True
+        with socket.create_connection((host, port), timeout=timeout):
+            online = True
     except OSError:
-        return False
+        online = False
+
+    _WIFI_CHECK_CACHE["checked_at"] = now
+    _WIFI_CHECK_CACHE["online"] = online
+    return online
 
 
 def sync_worker_loop() -> None:
