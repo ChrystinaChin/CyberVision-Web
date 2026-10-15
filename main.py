@@ -2494,16 +2494,17 @@ def render_resource_trend_preview() -> None:
 
 
 # =============================================================================
-# LIVE VIDEO STREAM (FULL-WIDTH 3x3 MATRIX)
+# LIVE VIDEO STREAM (SELF-CONTAINED FRAGMENT)
 # =============================================================================
-def render_video_frame(video_placeholder, status_placeholder) -> None:
+@st.fragment(run_every=0.75 if st.session_state.get("throttle_active") else 0.1)
+def live_camera_fragment():
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
         if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+            st.image(st.session_state.last_frame_rgb, use_container_width=True)
         else:
-            video_placeholder.image(
+            st.image(
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
                 use_container_width=True,
             )
@@ -2512,7 +2513,7 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
     if primary_frame is None and not active_frames:
-        status_placeholder.info(st.session_state.get("last_error") or "Camera unavailable.")
+        st.info(st.session_state.get("last_error") or "Camera unavailable.")
         return
 
     current_time = time.time()
@@ -2548,25 +2549,18 @@ def render_video_frame(video_placeholder, status_placeholder) -> None:
     grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
     st.session_state.last_frame_rgb = grid_rgb
 
-    video_placeholder.image(grid_rgb, channels="RGB", use_container_width=True)
+    # Direct rendering without external st.empty() containers avoids layout errors completely
+    st.image(grid_rgb, channels="RGB", use_container_width=True)
 
     if not YOLO_AVAILABLE:
-        status_placeholder.warning("Ultralytics is not installed.")
+        st.warning("Ultralytics is not installed.")
     elif not is_yolo_model_available():
-        status_placeholder.warning("YOLO model not found.")
+        st.warning("YOLO model not found.")
     elif yolo_result.get("detected"):
         detections = ", ".join(f"{d['class']} ({d['confidence']:.0%})" for d in yolo_result.get("detections", []))
-        status_placeholder.warning(f"YOLO detection: {detections}")
+        st.warning(f"YOLO detection: {detections}")
     else:
-        status_placeholder.success("Live camera monitoring active...")
-
-
-@st.fragment(run_every=0.75 if st.session_state.get("throttle_active") else 0.1)
-def live_camera_fragment():
-    # Placeholders instantiated inside fragment to avoid StreamlitInvalidLayoutContextError
-    video_container = st.empty()
-    status_container = st.empty()
-    render_video_frame(video_container, status_container)
+        st.success("Live camera monitoring active...")
 
 
 def render_video_feed() -> None:
@@ -2605,18 +2599,7 @@ def render_video_feed() -> None:
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
-    if not st.session_state.camera_running:
-        video_placeholder = st.empty()
-        if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
-        else:
-            video_placeholder.image(
-                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
-            )
-        return
-
-    # Fragment handles its own UI placeholders internally
+    # The fragment is isolated directly in the container block
     live_camera_fragment()
 
 
