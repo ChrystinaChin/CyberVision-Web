@@ -2496,9 +2496,17 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (FULLY CONTAINER-ISOLATED FRAGMENT)
 # =============================================================================
-@st.fragment(run_every=0.75 if st.session_state.get("throttle_active") else 0.1)
-def live_camera_fragment():
-    # Dedicated frame slot defined completely within fragment boundary
+def _show_frame(slot, image, **kwargs) -> None:
+    """Render an image into a slot, compatible with old and new Streamlit versions."""
+    try:
+        slot.image(image, width="stretch", **kwargs)
+    except TypeError:
+        slot.image(image, use_container_width=True, **kwargs)
+
+
+def _live_camera_body() -> None:
+    # FIX: every slot is created INSIDE the fragment. Containers created outside a
+    # fragment and passed in raise StreamlitInvalidLayoutContextError on fragment reruns.
     frame_slot = st.empty()
     status_slot = st.empty()
 
@@ -2506,11 +2514,11 @@ def live_camera_fragment():
 
     if not st.session_state.get("camera_running", False):
         if st.session_state.get("last_frame_rgb") is not None:
-            frame_slot.image(st.session_state.last_frame_rgb, use_container_width=True)
+            _show_frame(frame_slot, st.session_state.last_frame_rgb)
         else:
-            frame_slot.image(
+            _show_frame(
+                frame_slot,
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
             )
         return
 
@@ -2553,7 +2561,7 @@ def live_camera_fragment():
     grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
     st.session_state.last_frame_rgb = grid_rgb
 
-    frame_slot.image(grid_rgb, channels="RGB", use_container_width=True)
+    _show_frame(frame_slot, grid_rgb, channels="RGB")
 
     if not YOLO_AVAILABLE:
         status_slot.warning("Ultralytics is not installed.")
@@ -2564,6 +2572,12 @@ def live_camera_fragment():
         status_slot.warning(f"YOLO detection: {detections}")
     else:
         status_slot.success("Live camera monitoring active...")
+
+
+def live_camera_fragment() -> None:
+    # run_every is evaluated on every full rerun so throttling takes effect
+    refresh = 0.75 if st.session_state.get("throttle_active") else 0.1
+    st.fragment(_live_camera_body, run_every=refresh)()
 
 
 def render_video_feed() -> None:
