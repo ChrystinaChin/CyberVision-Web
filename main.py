@@ -2512,14 +2512,36 @@ def render_resource_trend_preview() -> None:
 # =============================================================================
 # LIVE VIDEO STREAM (STABLE FULL-WIDTH 3x3 MATRIX)
 # =============================================================================
+def _show_frame(slot, image, **kwargs) -> None:
+    """Draw an image into a slot; works on old and new Streamlit versions."""
+    try:
+        slot.image(image, width="stretch", **kwargs)
+    except Exception:
+        slot.image(image, use_container_width=True, **kwargs)
+
+
 @st.fragment(run_every=0.1)
-def live_camera_fragment(video_placeholder) -> None:
+def live_camera_fragment() -> None:
+    # FIX: the frame/status slots are created INSIDE the fragment. A placeholder
+    # created outside and passed in raises StreamlitInvalidLayoutContextError when
+    # the fragment reruns on its own (run_every).
+    frame_slot = st.empty()
+    status_slot = st.empty()
+
+    def _redraw_last_frame() -> None:
+        # Keeps the previous frame on screen when this run has nothing new to draw,
+        # otherwise the video would blink off on early returns.
+        last = st.session_state.get("last_frame_rgb")
+        if last is not None:
+            _show_frame(frame_slot, last, channels="RGB", output_format="JPEG")
+
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
         return
 
     if st.session_state.get("_frame_processing_busy"):
+        _redraw_last_frame()
         return
 
     st.session_state._frame_processing_busy = True
@@ -2527,7 +2549,8 @@ def live_camera_fragment(video_placeholder) -> None:
         active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
         if primary_frame is None and not active_frames:
-            st.error(st.session_state.get("last_error") or "Camera unavailable.")
+            _redraw_last_frame()
+            status_slot.error(st.session_state.get("last_error") or "Camera unavailable.")
             return
 
         current_time = time.time()
@@ -2567,12 +2590,9 @@ def live_camera_fragment(video_placeholder) -> None:
 
         # JPEG encodes far faster and more consistently than the default PNG,
         # which was the main source of frame-to-frame timing jitter (glitch).
-        video_placeholder.image(
-            grid_rgb, channels="RGB", use_container_width=True, output_format="JPEG"
-        )
+        _show_frame(frame_slot, grid_rgb, channels="RGB", output_format="JPEG")
     finally:
         st.session_state._frame_processing_busy = False
-
 
 def render_video_feed() -> None:
     header_col, btn_col1, btn_col2 = st.columns([6, 1, 1])
@@ -2613,9 +2633,8 @@ def render_video_feed() -> None:
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget(playing=st.session_state.camera_running)
 
-    video_placeholder = st.empty()
-
     if not st.session_state.camera_running:
+        video_placeholder = st.empty()
         if st.session_state.get("last_frame_rgb") is not None:
             video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
         else:
@@ -2626,7 +2645,7 @@ def render_video_feed() -> None:
         st.info("Camera is stopped. Detection paused.")
         return
 
-    live_camera_fragment(video_placeholder)
+    live_camera_fragment()
 
 
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
