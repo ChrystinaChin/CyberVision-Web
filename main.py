@@ -2764,9 +2764,16 @@ def render_dashboard_page() -> None:
 
     video_col, stats_col = st.columns([2.6, 1], gap="medium")
 
+    # Diagnostic switch: open the app URL with ?safe=1 to skip the camera / WebRTC
+    # widget. If the dashboard loads in safe mode, the problem is in that widget.
+    safe_mode = str(st.query_params.get("safe", "")) == "1"
+
     with video_col:
         with st.container(border=True):
-            render_video_feed()
+            if safe_mode:
+                st.info("Safe mode: camera and WebRTC are disabled for diagnostics.")
+            else:
+                render_video_feed()
             render_video_status_bar()
 
     with stats_col:
