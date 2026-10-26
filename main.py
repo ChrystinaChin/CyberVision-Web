@@ -1,4 +1,5 @@
 import base64
+import functools
 import io
 import json
 import os
@@ -6,6 +7,7 @@ import queue
 import re
 import socket
 import sqlite3
+import tempfile
 import threading
 import time
 import wave
@@ -61,13 +63,12 @@ except Exception:
     GCP_AVAILABLE = False
 
 try:
-    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase, RTCConfiguration
+    from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
     WEBRTC_AVAILABLE = True
 except Exception:
     webrtc_streamer = None
     WebRtcMode = None
     VideoProcessorBase = object
-    RTCConfiguration = None
     WEBRTC_AVAILABLE = False
 
 try:
@@ -79,10 +80,10 @@ except Exception:
 
 
 def is_cloud_environment() -> bool:
-    """Detect a hosted environment (e.g. Streamlit Community Cloud) that has
-    no physical camera device attached, so cv2.VideoCapture can never work
-    there and the app should fall back to capturing the visitor's own
-    browser camera over WebRTC instead.
+    """Detect a hosted environment (Streamlit Community Cloud, Render, Cloud Run,
+    Heroku, HF Spaces, ...). A hosted server has no physical camera, so
+    cv2.VideoCapture can never see the *visitor's* webcam there. In that case the
+    app captures the visitor's own browser camera over WebRTC instead.
     """
     force_webrtc = os.environ.get("CYBERVISION_FORCE_WEBRTC", "").strip().lower()
     if force_webrtc in ("1", "true", "yes"):
@@ -98,6 +99,10 @@ def is_cloud_environment() -> bool:
     if os.environ.get("HOME") == "/home/appuser":
         return True
 
+    for env_name in ("RENDER", "K_SERVICE", "DYNO", "RAILWAY_ENVIRONMENT", "SPACE_ID", "FLY_APP_NAME"):
+        if os.environ.get(env_name):
+            return True
+
     return False
 
 
@@ -112,6 +117,22 @@ def local_camera_available() -> bool:
         return False
 
 
+def _writable_data_dir() -> str:
+    """Hosted file systems are often read-only next to the source. Fall back to
+    the OS temp dir so the SQLite buffer and pending uploads always work."""
+    base = os.path.dirname(os.path.abspath(__file__))
+    try:
+        probe = os.path.join(base, ".cv_write_test")
+        with open(probe, "w") as f:
+            f.write("ok")
+        os.remove(probe)
+        return base
+    except Exception:
+        return tempfile.gettempdir()
+
+
+_DATA_DIR = _writable_data_dir()
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
@@ -120,7 +141,7 @@ CONFIG: Dict[str, Any] = {
     "APP_SUBTITLE": "Adaptive Context Optimization at the Edge",
     "VLM_MODEL": "moondream",
     "CAMERA_INDEX": 0,
-    "CAMERA_SOURCES": [0, 1, 2, 3, 4, 5, 6, 7, 8],  # 3x3 Grid Sources
+    "CAMERA_SOURCES": [0, 1, 2, 3, 4, 5, 6, 7, 8],  # 3x3 Grid Sources (local mode only)
     "FRAME_WIDTH": 640,
     "FRAME_HEIGHT": 300,
     "JPEG_QUALITY": 70,
@@ -132,12 +153,13 @@ CONFIG: Dict[str, Any] = {
     "METRICS_HISTORY_MAX": 150,
     "LATENCY_HISTORY_MAX": 100,
     "TOAST_DISPLAY_SECONDS": 6.0,
+    "CLOUD_UPLOAD_MIN_INTERVAL_SEC": 3.0,
     "YARA_RULE_PATH": "hazard_rules.yar",
     # GCP Credentials & Bucket Configuration
     "GCP_BUCKET": "cybervision_history",
     "GCP_PROJECT_ID": "c5c505d599a4735f61c6c6896dd3f47a2c28337b",
-    "DB_FILE": "cybervision_buffer.db",
-    "PENDING_UPLOADS_DIR": "pending_gcp_uploads",
+    "DB_FILE": os.path.join(_DATA_DIR, "cybervision_buffer.db"),
+    "PENDING_UPLOADS_DIR": os.path.join(_DATA_DIR, "pending_gcp_uploads"),
     "YOLO_MODEL_PATH": os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "YOLO_dataset.pt",
@@ -194,9 +216,7 @@ _WIFI_CHECK_TTL_SECONDS = 15.0
 
 def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: float = 1.0) -> bool:
     # Cached for a few seconds: this is called on every rerun (sidebar, settings
-    # panel, sync thread). The old version blocked up to 2s per call, leaked an
-    # unclosed socket each time, and set a process-wide default socket timeout
-    # that affected every other network call (including the Google login flow).
+    # panel, sync thread).
     now = time.time()
     if now - _WIFI_CHECK_CACHE["checked_at"] < _WIFI_CHECK_TTL_SECONDS:
         return bool(_WIFI_CHECK_CACHE["online"])
@@ -243,12 +263,17 @@ def sync_worker_loop() -> None:
         time.sleep(10)
 
 
+@st.cache_resource(show_spinner=False)
+def _start_sync_thread_once() -> bool:
+    # WEB FIX: a hosted app serves many sessions from one process. The old code
+    # started a new sync thread per browser session; this starts exactly one.
+    init_db()
+    threading.Thread(target=sync_worker_loop, daemon=True, name="cybervision-sync").start()
+    return True
+
+
 def start_sync_thread() -> None:
-    if "sync_thread_started" not in st.session_state:
-        init_db()
-        sync_thread = threading.Thread(target=sync_worker_loop, daemon=True)
-        sync_thread.start()
-        st.session_state.sync_thread_started = True
+    _start_sync_thread_once()
 
 
 # =============================================================================
@@ -284,6 +309,7 @@ def init_session_state() -> None:
         "alarm_active": False,
         "vlm_in_progress": False,
         "last_triggered_alert_ts": 0.0,
+        "last_cloud_upload_ts": 0.0,
         "active_hazard_toast": None,
         "active_page": "Dashboard",
         "webrtc_ctx": None,
@@ -300,15 +326,16 @@ def init_session_state() -> None:
         st.session_state.webrtc_unavailable_on_cloud = needs_browser_camera and not WEBRTC_AVAILABLE
 
 
-@st.cache_data
 def inject_custom_css() -> None:
+    # NOTE: intentionally NOT wrapped in @st.cache_data. Caching a function that
+    # emits elements relies on cached-element replay, which is fragile; the CSS
+    # block is tiny so it is simply re-emitted on each run.
     bg = "#fff7ed"
     panel_warm = "#fff3e6"
     text = "#1f2937"
     muted = "#6b7280"
     accent = "#f97316"
     accent_dark = "#c2410c"
-    border = "#fed7aa"
 
     st.markdown(
         f"""
@@ -357,13 +384,13 @@ def inject_custom_css() -> None:
 
         div[data-baseweb="select"] > div {{
             background: rgba(255,255,255,0.95) !important;
-            border: 1px solid {border} !important;
+            border: none !important;
             color: {accent_dark} !important;
         }}
 
         [data-testid="stSidebar"] {{
             background: linear-gradient(180deg, #ffffff 0%, {panel_warm} 100%) !important;
-            border-right: 1px solid {border};
+            border-right: none !important;
         }}
 
         [data-testid="stSidebar"] h1,
@@ -387,7 +414,7 @@ def inject_custom_css() -> None:
             background:
                 linear-gradient(135deg, rgba(255,255,255,0.96), rgba(255,237,213,0.96)),
                 radial-gradient(circle at top right, rgba(249,115,22,0.28), transparent 35%);
-            border: 1px solid {border};
+            border: none;
             border-radius: 20px;
             margin-bottom: 0.4rem;
             box-shadow: 0 10px 26px rgba(249,115,22,0.13);
@@ -409,7 +436,7 @@ def inject_custom_css() -> None:
             padding: 0.22rem 0.65rem;
             border-radius: 999px;
             background: rgba(249,115,22,0.12);
-            border: 1px solid rgba(249,115,22,0.35);
+            border: none;
             color: {accent_dark};
             font-weight: 900;
             font-size: 0.7rem;
@@ -419,7 +446,7 @@ def inject_custom_css() -> None:
 
         div[data-testid="stMetric"] {{
             background: rgba(255,255,255,0.94);
-            border: 1px solid {border};
+            border: none !important;
             border-radius: 12px;
             padding: 0.3rem 0.5rem;
             height: 84px;
@@ -450,7 +477,8 @@ def inject_custom_css() -> None:
             fill: {muted} !important;
         }}
 
-        .stButton > button {{
+        .stButton > button,
+        .stDownloadButton > button {{
             border-radius: 14px;
             font-weight: 800;
             border: 1px solid #fb923c;
@@ -460,7 +488,8 @@ def inject_custom_css() -> None:
             transition: all 0.18s ease-in-out;
         }}
 
-        .stButton > button:hover {{
+        .stButton > button:hover,
+        .stDownloadButton > button:hover {{
             background: linear-gradient(135deg, #fed7aa, #fdba74);
             color: #7c2d12;
             border-color: {accent};
@@ -473,7 +502,7 @@ def inject_custom_css() -> None:
             right: 1.1rem;
             z-index: 1000000;
             background: #ffffff;
-            border: 1px solid {border};
+            border: none;
             border-left: 7px solid {accent};
             border-radius: 18px;
             box-shadow: 0 18px 40px rgba(15, 23, 42, 0.22);
@@ -604,7 +633,7 @@ def inject_custom_css() -> None:
             justify-content: flex-start !important;
             text-align: left !important;
             background: transparent !important;
-            border: 1px solid transparent !important;
+            border: none !important;
             box-shadow: none !important;
             font-weight: 700 !important;
             color: {text} !important;
@@ -627,7 +656,7 @@ def inject_custom_css() -> None:
         [data-testid="stSidebar"] .stButton > button[kind="primary"] {{
             background: linear-gradient(135deg, {accent}, {accent_dark}) !important;
             color: #ffffff !important;
-            border: 1px solid {accent_dark} !important;
+            border: none !important;
             box-shadow: 0 8px 18px rgba(249,115,22,0.30) !important;
         }}
 
@@ -637,7 +666,8 @@ def inject_custom_css() -> None:
         }}
 
         .sidebar-footer-divider {{
-            border-top: 1px solid {border};
+            height: 1px;
+            background: rgba(249,115,22,0.18);
             margin: 1.2rem 0 0.9rem 0;
         }}
 
@@ -699,7 +729,7 @@ def inject_custom_css() -> None:
             padding: 0.55rem 0.6rem;
             border-radius: 14px;
             background: rgba(249,115,22,0.08);
-            border: 1px solid {border};
+            border: none;
             margin-bottom: 0.5rem;
         }}
 
@@ -751,16 +781,6 @@ def inject_custom_css() -> None:
             gap: 0.6rem;
         }}
 
-        .dash-header-left {{
-            display: flex;
-            align-items: center;
-            gap: 0.65rem;
-        }}
-
-        .dash-header-icon {{
-            font-size: 1.6rem;
-        }}
-
         .dash-header-title {{
             font-weight: 900;
             font-size: 1.35rem;
@@ -781,8 +801,7 @@ def inject_custom_css() -> None:
             gap: 0.45rem;
             padding: 0.35rem 0.85rem;
             border-radius: 999px;
-            border: 1px solid;
-            background: rgba(255,255,255,0.9);
+            border: none;
             font-weight: 800;
             font-size: 0.72rem;
             letter-spacing: 0.05em;
@@ -795,11 +814,19 @@ def inject_custom_css() -> None:
             border-radius: 50%;
         }}
 
+        /* Bordered containers (video panel, stats panels): no outline, soft shadow only */
         [data-testid="stVerticalBlockBorderWrapper"] {{
             background: rgba(255,255,255,0.94) !important;
-            border: 1px solid {border} !important;
+            border: none !important;
+            outline: none !important;
             border-radius: 18px !important;
             box-shadow: 0 10px 26px rgba(249,115,22,0.10) !important;
+        }}
+
+        [data-testid="stExpander"],
+        [data-testid="stExpander"] details {{
+            border: none !important;
+            outline: none !important;
         }}
 
         .stats-panel-title {{
@@ -824,21 +851,12 @@ def inject_custom_css() -> None:
             color: {accent_dark};
         }}
 
+        /* Browser-camera (WebRTC) connector: kept VISIBLE and compact. Hiding it
+           (0px height / opacity 0) stops browsers from showing the camera
+           permission prompt, which is why the feed never appeared. */
         .st-key-webrtc_transport {{
-            height: 0 !important;
-            min-height: 0 !important;
-            max-height: 0 !important;
-            overflow: hidden !important;
-            margin: 0 !important;
-            padding: 0 !important;
-            border: 0 !important;
-        }}
-        .st-key-webrtc_transport iframe {{
-            height: 1px !important;
-            min-height: 1px !important;
-            max-height: 1px !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
+            min-height: 3rem;
+            overflow: visible !important;
         }}
         </style>
         """,
@@ -849,7 +867,8 @@ def inject_custom_css() -> None:
 # =============================================================================
 # AUDIO & NOTIFICATION DISPATCHER
 # =============================================================================
-def build_beep_wav_base64(duration: float = 0.35, freq: int = 1050, sample_rate: int = 44100) -> str:
+@functools.lru_cache(maxsize=4)
+def build_beep_wav_base64(duration: float = 0.45, freq: int = 1100, sample_rate: int = 44100) -> str:
     t = np.linspace(0, duration, int(sample_rate * duration), False)
     tone = np.sin(freq * t * 2 * np.pi)
     envelope = np.linspace(1, 0.15, tone.size)
@@ -865,25 +884,15 @@ def build_beep_wav_base64(duration: float = 0.35, freq: int = 1050, sample_rate:
     return base64.b64encode(buffer.getvalue()).decode("utf-8")
 
 
-def play_alert_sound() -> None:
-    if not st.session_state.sound_enabled:
-        return
-
-    audio_b64 = build_beep_wav_base64(duration=0.45, freq=1100)
-    audio_html = f"""
-        <audio autoplay style="display:none;">
-            <source src="data:audio/wav;base64,{audio_b64}" type="audio/wav">
-        </audio>
-    """
-    st.markdown(audio_html, unsafe_allow_html=True)
-
-
+@functools.lru_cache(maxsize=4)
 def build_siren_wav_base64(
     duration: float = 1.6,
     low_freq: int = 900,
     high_freq: int = 1500,
     sample_rate: int = 44100,
 ) -> str:
+    # lru_cache: this used to be rebuilt (numpy + base64 of ~280 KB) on every
+    # 100 ms tick while CRITICAL.
     segment_len = max(1, int(sample_rate * duration / 4))
     t_seg = np.linspace(0, duration / 4, segment_len, False)
 
@@ -941,21 +950,16 @@ def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
         alert_title = "SMOKE DETECTED"
         hazard_word = "smoke"
 
-    detection_line = f"The system detected clear signs of {hazard_word}."
-    action_line = "Please evacuate from the area immediately."
-    checked_time = datetime.now().strftime("%H:%M:%S")
-
     st.session_state.active_hazard_toast = {
         "severity": severity_norm,
         "alert_title": alert_title,
-        "detection_line": detection_line,
-        "action_line": action_line,
-        "checked_time": checked_time,
+        "detection_line": f"The system detected clear signs of {hazard_word}.",
+        "action_line": "Please evacuate from the area immediately.",
+        "checked_time": datetime.now().strftime("%H:%M:%S"),
         "triggered_at": now,
+        # CRITICAL uses the looping siren instead of the one-shot beep.
+        "beep": severity_norm != "CRITICAL",
     }
-
-    if severity_norm != "CRITICAL":
-        play_alert_sound()
 
 
 def render_custom_hazard_toast() -> None:
@@ -966,6 +970,19 @@ def render_custom_hazard_toast() -> None:
     if time.time() - toast_data["triggered_at"] > CONFIG["TOAST_DISPLAY_SECONDS"]:
         return
 
+    # WEB FIX: the beep used to be emitted once, inside a fragment that re-runs
+    # every 100 ms, so the <audio> element was removed before it finished
+    # playing. It is now rendered for as long as the toast is visible; the unique
+    # id makes the browser re-mount (and so replay) it for each new alert.
+    audio_html = ""
+    if toast_data.get("beep") and st.session_state.sound_enabled:
+        beep_id = int(toast_data["triggered_at"] * 1000)
+        audio_html = (
+            f'<audio id="beep-{beep_id}" autoplay style="display:none;">'
+            f'<source src="data:audio/wav;base64,{build_beep_wav_base64()}" type="audio/wav">'
+            f"</audio>"
+        )
+
     st.markdown(
         f"""
         <div class="hazard-toast">
@@ -973,6 +990,7 @@ def render_custom_hazard_toast() -> None:
             <div class="toast-line toast-detection">{toast_data['detection_line']}</div>
             <div class="toast-line toast-action">{toast_data['action_line']}</div>
             <div class="toast-meta">Last checked: {toast_data['checked_time']}</div>
+            {audio_html}
         </div>
         """,
         unsafe_allow_html=True,
@@ -1043,8 +1061,6 @@ class ResourceGovernor:
 # BROWSER CAMERA (WEBRTC)
 # =============================================================================
 if WEBRTC_AVAILABLE:
-    from streamlit_webrtc import VideoHTMLAttributes
-
     class BrowserCameraProcessor(VideoProcessorBase):
         def __init__(self) -> None:
             self._lock = threading.Lock()
@@ -1061,7 +1077,6 @@ if WEBRTC_AVAILABLE:
                 return None if self._latest_frame is None else self._latest_frame.copy()
 else:
     BrowserCameraProcessor = None
-    VideoHTMLAttributes = None
 
 
 def _get_secret(name: str) -> Optional[str]:
@@ -1253,44 +1268,73 @@ def _describe_ice_servers(ice_servers: list) -> str:
         return ":material/check_circle: Browser camera relay: Cloudflare TURN configured."
     if has_turn_credential:
         return ":material/check_circle: Browser camera relay: TURN relay configured."
-    return ":material/info: Browser camera relay: STUN configured."
+    return ":material/info: Browser camera relay: STUN only (may fail behind strict networks)."
 
 
-def render_browser_camera_widget(playing: bool) -> None:
+def render_browser_camera_widget() -> None:
+    """Mounts the WebRTC connector that streams the VISITOR's webcam to the server.
+
+    Fixes for "camera doesn't display when started":
+      * SENDRECV instead of SENDONLY. In SENDONLY mode streamlit-webrtc does not
+        run the video processor, so BrowserCameraProcessor.recv() was never called
+        and the app waited forever for a first frame.
+      * The widget is visible (it used to be collapsed to 0px with opacity 0, which
+        stops browsers from showing the camera permission prompt).
+      * Removed the unsupported `media_toggle_controls` argument.
+    """
     if not WEBRTC_AVAILABLE:
-        if playing:
-            st.error(
-                "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
-                "which are listed in requirements.txt but failed to import. Check the "
-                "deployment logs — this is usually a missing system library (see "
-                "packages.txt: libavformat-dev, libavdevice-dev, libgl1)."
-            )
+        st.error(
+            "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
+            "which are listed in requirements.txt but failed to import. Check the "
+            "deployment logs — this is usually a missing system library (see "
+            "packages.txt: libavformat-dev, libavdevice-dev, libgl1)."
+        )
         return
+
+    ice_servers = get_ice_servers()
 
     with st.container(key="webrtc_transport"):
         ctx = webrtc_streamer(
             key="cybervision-browser-camera",
-            mode=WebRtcMode.SENDONLY,
-            desired_playing_state=playing,
-            rtc_configuration=RTCConfiguration({"iceServers": get_ice_servers()}),
-            media_stream_constraints={"video": True, "audio": False},
+            mode=WebRtcMode.SENDRECV,
+            desired_playing_state=True,
+            rtc_configuration={"iceServers": ice_servers},
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 640},
+                    "height": {"ideal": 480},
+                    "frameRate": {"ideal": 15},
+                },
+                "audio": False,
+            },
             video_processor_factory=BrowserCameraProcessor,
-            video_html_attrs=VideoHTMLAttributes(
-                autoPlay=True, controls=False, muted=True, style={"display": "none"}
-            ),
-            media_toggle_controls=False,
+            video_html_attrs={
+                "autoPlay": True,
+                "controls": False,
+                "muted": True,
+                "style": {"display": "none"},
+            },
             async_processing=True,
         )
+
     st.session_state.webrtc_ctx = ctx
+
+    state = getattr(ctx, "state", None)
+    if state is not None and getattr(state, "playing", False):
+        st.caption(":material/videocam: Browser camera connected.")
+    else:
+        st.caption(
+            ":material/videocam: Allow camera access when your browser asks. "
+            "If no prompt appears, press START above."
+        )
+    st.caption(_describe_ice_servers(ice_servers))
 
 
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX (OPTIMIZED NON-BLOCKING)
+# MULTI-CAMERA HANDLING & 3x3 MATRIX (LOCAL DEVICES ONLY)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
-    # One long-lived pool, reused across every fragment tick instead of
-    # being created and torn down every 100ms.
     return ThreadPoolExecutor(max_workers=max(1, n_workers))
 
 
@@ -1347,8 +1391,6 @@ _BLANK_TILE_CACHE: Dict[Tuple[int, int, str], np.ndarray] = {}
 
 
 def get_cached_blank_tile(width: int, height: int, label: str) -> np.ndarray:
-    # The "NO CAMERA" tile is identical every tick — draw it once and reuse
-    # the array instead of re-running cv2.putText/rectangle 10x/second.
     key = (width, height, label)
     tile = _BLANK_TILE_CACHE.get(key)
     if tile is None:
@@ -1377,7 +1419,6 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
     return np.vstack([row1, row2, row3])
 
 
-
 class VideoCaptureManager:
     @staticmethod
     def capture_active_frames() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
@@ -1397,8 +1438,17 @@ class VideoCaptureManager:
             st.session_state.last_error = "Waiting for first frame from browser camera..."
             return {}, None
 
-        primary_frame = cv2.resize(frame, (CONFIG["FRAME_WIDTH"], CONFIG["FRAME_HEIGHT"]))
-        return {0: frame}, primary_frame
+        # Keep the camera's real aspect ratio (the old fixed 640x300 resize
+        # squashed 4:3 webcams).
+        h, w = frame.shape[:2]
+        target_w = CONFIG["FRAME_WIDTH"]
+        target_h = max(1, int(round(h * target_w / max(w, 1))))
+        primary_frame = cv2.resize(frame, (target_w, target_h))
+
+        if str(st.session_state.get("last_error", "")).startswith("Waiting for"):
+            st.session_state.last_error = ""
+
+        return {0: primary_frame}, primary_frame
 
     @staticmethod
     def _capture_from_local_devices() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
@@ -1419,7 +1469,6 @@ class VideoCaptureManager:
                     return idx, frame
             return idx, None
 
-        # Single camera: skip threading entirely, it's pure overhead.
         if len(caps) == 1:
             results = [_read_cam(item) for item in caps.items()]
         else:
@@ -1445,7 +1494,7 @@ class VideoCaptureManager:
         cv2.putText(
             frame,
             message,
-            (55, 220),
+            (55, 140),
             cv2.FONT_HERSHEY_SIMPLEX,
             1.0,
             (0, 255, 170),
@@ -1456,9 +1505,9 @@ class VideoCaptureManager:
             cv2.putText(
                 frame,
                 subtext,
-                (55, 265),
+                (55, 185),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.65,
+                0.6,
                 (220, 220, 220),
                 1,
             )
@@ -1794,10 +1843,11 @@ class VisualFireSmokeDetector:
 # =============================================================================
 class VLMInference:
     @staticmethod
-    def _async_worker(frame: np.ndarray, token_budget: int) -> None:
+    def _async_worker(frame: np.ndarray, token_budget: int, host: Optional[str]) -> None:
         try:
             image_b64 = frame_to_base64_jpeg(frame)
-            response = ollama.chat(
+            client = ollama.Client(host=host) if host else ollama.Client()
+            response = client.chat(
                 model=CONFIG["VLM_MODEL"],
                 messages=[
                     {
@@ -1839,11 +1889,19 @@ class VLMInference:
         if st.session_state.get("vlm_in_progress", False):
             return
 
+        # WEB FIX: Ollama on "localhost" only exists on your own machine. On a
+        # hosted deployment, set OLLAMA_HOST (env var or secret) to a reachable
+        # server (e.g. http://my-vps:11434); without it the VLM step is skipped
+        # and detection continues with YOLO + the OpenCV fallback.
+        host = _get_secret("OLLAMA_HOST")
+        if is_cloud_environment() and not host:
+            return
+
         st.session_state.vlm_in_progress = True
         token_budget = ResourceGovernor.recommended_token_budget()
         thread = threading.Thread(
             target=VLMInference._async_worker,
-            args=(frame.copy(), token_budget),
+            args=(frame.copy(), token_budget, host),
             daemon=True
         )
         thread.start()
@@ -1873,7 +1931,6 @@ def compile_yara_rules():
         return None
 
     if not os.path.exists(CONFIG["YARA_RULE_PATH"]):
-        st.session_state.last_error = "hazard_rules.yar not found."
         return None
 
     return yara.compile(filepath=CONFIG["YARA_RULE_PATH"])
@@ -2014,7 +2071,10 @@ def flush_pending_cloud_uploads() -> None:
             continue
 
 
-def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> None:
+def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud_sync_enabled: bool) -> None:
+    # WEB FIX: `cloud_sync_enabled` is read on the Streamlit script thread and
+    # passed in. The old worker read st.session_state from a plain background
+    # thread, which has no session context, so the cloud upload never ran.
     def _worker():
         save_event_locally(
             time.time(),
@@ -2023,7 +2083,7 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> No
             camera_id="CAM_01"
         )
 
-        if not st.session_state.cloud_sync_enabled or not GCP_AVAILABLE or storage is None:
+        if not cloud_sync_enabled or not GCP_AVAILABLE or storage is None:
             return
 
         if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
@@ -2050,11 +2110,10 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any]) -> No
                 return
             bucket = client.bucket(CONFIG["GCP_BUCKET"])
 
-            image_blob = bucket.blob(image_name)
-            image_blob.upload_from_string(buffer.tobytes(), content_type="image/jpeg")
-
-            log_blob = bucket.blob(log_name)
-            log_blob.upload_from_string(str(alert), content_type="application/json")
+            bucket.blob(image_name).upload_from_string(buffer.tobytes(), content_type="image/jpeg")
+            bucket.blob(log_name).upload_from_string(
+                json.dumps(alert, default=str), content_type="application/json"
+            )
         except Exception:
             _queue_image_for_later_upload(frame, alert)
 
@@ -2068,7 +2127,7 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
     if not latest or latest.get("severity") == "NORMAL":
         return "Environment is Safe"
 
-    classes = [c.lower() for c in latest.get("yolo_classes", "").split(",") if c.strip()]
+    classes = [c.strip().lower() for c in latest.get("yolo_classes", "").split(",") if c.strip()]
     description = latest.get("description", "").lower()
     keyword = str(latest.get("matched_keyword", "")).lower()
 
@@ -2226,8 +2285,15 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
 
     play_critical_alarm(yolo_severity == "CRITICAL")
 
+    # WEB FIX: throttle uploads. At ~10 ticks/second this used to write a
+    # SQLite row + Firestore doc + bucket objects for every single frame.
     if is_hazard:
-        upload_to_google_cloud_async(frame, alert)
+        now = time.time()
+        if now - st.session_state.get("last_cloud_upload_ts", 0.0) >= CONFIG["CLOUD_UPLOAD_MIN_INTERVAL_SEC"]:
+            st.session_state.last_cloud_upload_ts = now
+            upload_to_google_cloud_async(
+                frame, dict(alert), bool(st.session_state.cloud_sync_enabled)
+            )
 
     return {
         "annotated_frame": yolo_result.get("annotated_frame", frame),
@@ -2340,11 +2406,11 @@ def render_sidebar_nav() -> None:
         st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
         st.markdown("<div class='nav-section-label'>Workspace</div>", unsafe_allow_html=True)
 
+        # "Export Reports" now lives inside the Data Logs tab.
         nav_items = [
             ("Dashboard", "dashboard"),
             ("Analytics", "bar_chart"),
             ("Data Logs", "table_chart"),
-            ("Export Reports", "description"),
         ]
 
         for label, icon_name in nav_items:
@@ -2441,21 +2507,21 @@ def render_dashboard_header() -> None:
     yolo_ready = is_yolo_model_available()
 
     if cam_running and yolo_ready:
-        pill_text, pill_color = "YOLO ACTIVE", "#30d158"
+        pill_text, pill_color = "YOLO ACTIVE", "#16a34a"
     elif cam_running:
-        pill_text, pill_color = "FALLBACK MODE", "#ffd60a"
+        pill_text, pill_color = "FALLBACK MODE", "#ca8a04"
     else:
-        pill_text, pill_color = "STANDBY", "#9ca3af"
+        pill_text, pill_color = "STANDBY", "#6b7280"
 
+    # (The old markup had two stray closing </div> tags that broke the layout.)
     st.markdown(
         f"""
         <div class="dash-header">
-                <div>
-                    <div class="dash-header-title">Live Camera Feeds</div>
-                    <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
-                </div>
+            <div>
+                <div class="dash-header-title">Live Camera Feeds</div>
+                <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
             </div>
-            <div class="status-pill-live" style="border-color:{pill_color}66; color:{pill_color};">
+            <div class="status-pill-live" style="background:{pill_color}1f; color:{pill_color};">
                 <span class="status-pill-dot" style="background:{pill_color};"></span>
                 {pill_text}
             </div>
@@ -2525,7 +2591,7 @@ def render_resource_trend_preview() -> None:
 
 
 # =============================================================================
-# LIVE VIDEO STREAM (STABLE FULL-WIDTH 3x3 MATRIX)
+# LIVE VIDEO STREAM
 # =============================================================================
 def _show_frame(slot, image, **kwargs) -> None:
     """Draw an image into a slot; works on old and new Streamlit versions."""
@@ -2537,15 +2603,13 @@ def _show_frame(slot, image, **kwargs) -> None:
 
 @st.fragment(run_every=0.1)
 def live_camera_fragment() -> None:
-    # FIX: the frame/status slots are created INSIDE the fragment. A placeholder
+    # The frame/status slots are created INSIDE the fragment. A placeholder
     # created outside and passed in raises StreamlitInvalidLayoutContextError when
     # the fragment reruns on its own (run_every).
     frame_slot = st.empty()
     status_slot = st.empty()
 
     def _redraw_last_frame() -> None:
-        # Keeps the previous frame on screen when this run has nothing new to draw,
-        # otherwise the video would blink off on early returns.
         last = st.session_state.get("last_frame_rgb")
         if last is not None:
             _show_frame(frame_slot, last, channels="RGB", output_format="JPEG")
@@ -2561,11 +2625,29 @@ def live_camera_fragment() -> None:
 
     st.session_state._frame_processing_busy = True
     try:
+        use_webrtc = bool(st.session_state.get("use_webrtc"))
         active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
         if primary_frame is None and not active_frames:
-            _redraw_last_frame()
-            status_slot.error(st.session_state.get("last_error") or "Camera unavailable.")
+            # WEB FIX: while the browser camera is still connecting, show a clear
+            # "starting" tile (not a blank area) and an info message (not an error).
+            if st.session_state.get("last_frame_rgb") is not None:
+                _redraw_last_frame()
+            else:
+                _show_frame(
+                    frame_slot,
+                    VideoCaptureManager.placeholder_frame(
+                        "Starting camera...",
+                        "Allow camera access in your browser.",
+                    ),
+                    channels="RGB",
+                    output_format="JPEG",
+                )
+            message = st.session_state.get("last_error") or "Camera unavailable."
+            if use_webrtc:
+                status_slot.info(message)
+            else:
+                status_slot.error(message)
             return
 
         current_time = time.time()
@@ -2577,37 +2659,39 @@ def live_camera_fragment() -> None:
         st.session_state.frames_processed += 1
 
         pipeline_result = run_detection_pipeline(primary_frame)
+        yolo_result = pipeline_result.get("yolo", {})
 
         if 0 in active_frames and primary_frame is not None:
-            yolo_for_overlay = pipeline_result.get("yolo", {})
-            active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(
-                primary_frame, yolo_for_overlay
-            )
+            active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(primary_frame, yolo_result)
 
-        grid_matrix = construct_3x3_grid(active_frames)
+        if use_webrtc:
+            # A visitor has exactly one webcam: show it full-width instead of one
+            # live tile surrounded by eight "NO CAMERA" tiles.
+            display = active_frames[0].copy()
+        else:
+            display = construct_3x3_grid(active_frames)
 
         severity = st.session_state.get("yolo_severity", "NORMAL")
-        yolo_result = pipeline_result.get("yolo", {})
         yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
 
         hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
         hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
 
-        overlay = grid_matrix.copy()
+        overlay = display.copy()
         cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.50, grid_matrix, 0.50, 0, grid_matrix)
+        cv2.addWeighted(overlay, 0.50, display, 0.50, 0, display)
 
-        cv2.putText(grid_matrix, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
-        cv2.putText(grid_matrix, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+        cv2.putText(display, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+        cv2.putText(display, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
 
-        grid_rgb = cv2.cvtColor(grid_matrix, cv2.COLOR_BGR2RGB)
-        st.session_state.last_frame_rgb = grid_rgb
+        display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        st.session_state.last_frame_rgb = display_rgb
 
-        # JPEG encodes far faster and more consistently than the default PNG,
-        # which was the main source of frame-to-frame timing jitter (glitch).
-        _show_frame(frame_slot, grid_rgb, channels="RGB", output_format="JPEG")
+        # JPEG encodes far faster and more consistently than the default PNG.
+        _show_frame(frame_slot, display_rgb, channels="RGB", output_format="JPEG")
     finally:
         st.session_state._frame_processing_busy = False
+
 
 def render_video_feed() -> None:
     header_col, btn_col1, btn_col2 = st.columns([6, 1, 1])
@@ -2619,6 +2703,7 @@ def render_video_feed() -> None:
             st.session_state.last_vlm_candidate_frame = None
             st.session_state.latest_vlm_text = ""
             st.session_state.last_frame_time = time.time()
+            st.session_state.last_frame_rgb = None
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.alarm_active = False
@@ -2645,24 +2730,29 @@ def render_video_feed() -> None:
             "Detection cannot start until that's fixed."
         )
 
-    if st.session_state.get("use_webrtc"):
-        render_browser_camera_widget(playing=st.session_state.camera_running)
-
     if not st.session_state.camera_running:
         video_placeholder = st.empty()
         if st.session_state.get("last_frame_rgb") is not None:
-            video_placeholder.image(st.session_state.last_frame_rgb, use_container_width=True)
+            _show_frame(video_placeholder, st.session_state.last_frame_rgb)
         else:
-            video_placeholder.image(
+            _show_frame(
+                video_placeholder,
                 VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
-                use_container_width=True,
             )
         st.info("Camera is stopped. Detection paused.")
         return
 
+    # The WebRTC connector is only mounted while the camera is running, so
+    # pressing Stop also releases the visitor's webcam.
+    if st.session_state.get("use_webrtc"):
+        render_browser_camera_widget()
+
     live_camera_fragment()
 
 
+# =============================================================================
+# DATA LOGS (now includes Export Reports)
+# =============================================================================
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
     if not st.session_state.alert_history:
         return None
@@ -2684,47 +2774,52 @@ def _build_forensic_display_df() -> Optional[pd.DataFrame]:
 
 
 def render_data_logs_page() -> None:
-    header_col, btn_col = st.columns([5, 1.3])
+    display_df = _build_forensic_display_df()
+
+    header_col, export_col, reset_col = st.columns([4, 1.6, 1.2])
     with header_col:
         st.markdown("### Data Logs")
         st.markdown("<p class='muted'>Full forensic event history captured by the detection pipeline.</p>", unsafe_allow_html=True)
-    with btn_col:
+
+    with export_col:
+        st.markdown("<div style='height: 1.7rem;'></div>", unsafe_allow_html=True)
+        if display_df is None:
+            st.button(
+                "Export report",
+                icon=":material/download:",
+                use_container_width=True,
+                disabled=True,
+                key="export_csv_disabled_btn",
+                help="No events logged yet — nothing to export.",
+            )
+        else:
+            st.download_button(
+                "Export report",
+                icon=":material/download:",
+                data=display_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"cybervision_forensic_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_csv_btn",
+                help=f"Download {len(display_df)} logged events as CSV.",
+            )
+
+    with reset_col:
         st.markdown("<div style='height: 1.7rem;'></div>", unsafe_allow_html=True)
         if st.button("Reset logs", icon=":material/restart_alt:", use_container_width=True, key="reset_logs_btn"):
             st.session_state.alert_history.clear()
             st.session_state.latency_history.clear()
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
-            st.success("Logs reset.")
+            st.toast("Logs reset.")
+            st.rerun()
 
-    display_df = _build_forensic_display_df()
     if display_df is None:
         st.info("No events logged yet.")
         return
 
+    st.caption(f"{len(display_df)} events ready to export.")
     st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
-
-
-def render_export_reports_page() -> None:
-    st.markdown("### Export Reports")
-    st.markdown("<p class='muted'>Download the forensic alert log for offline analysis or auditing.</p>", unsafe_allow_html=True)
-
-    display_df = _build_forensic_display_df()
-    if display_df is None:
-        st.info("No events logged yet — nothing to export.")
-        return
-
-    st.metric("Events ready to export", len(display_df))
-
-    st.download_button(
-        "Download alerts log CSV",
-        icon=":material/download:",
-        data=display_df.to_csv(index=False).encode("utf-8"),
-        file_name=f"cybervision_forensic_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
-        mime="text/csv",
-        use_container_width=True,
-        key="download_csv_btn"
-    )
 
 
 def render_charts() -> None:
@@ -2804,6 +2899,10 @@ def main() -> None:
     start_sync_thread()
     inject_custom_css()
 
+    # Export Reports was merged into Data Logs; keep old session state valid.
+    if st.session_state.active_page == "Export Reports":
+        st.session_state.active_page = "Data Logs"
+
     render_sidebar_nav()
 
     page = st.session_state.active_page
@@ -2814,8 +2913,6 @@ def main() -> None:
         render_analytics_page()
     elif page == "Data Logs":
         render_data_logs_page()
-    elif page == "Export Reports":
-        render_export_reports_page()
     else:
         st.session_state.active_page = "Dashboard"
         render_dashboard_page()
