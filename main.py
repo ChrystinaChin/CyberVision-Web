@@ -267,6 +267,8 @@ def sync_worker_loop() -> None:
 
 @st.cache_resource(show_spinner=False)
 def _start_sync_thread_once() -> bool:
+    # WEB FIX: a hosted app serves many sessions from one process. The old code
+    # started a new sync thread per browser session; this starts exactly one.
     init_db()
     threading.Thread(target=sync_worker_loop, daemon=True, name="cybervision-sync").start()
     return True
@@ -327,6 +329,9 @@ def init_session_state() -> None:
 
 
 def inject_custom_css() -> None:
+    # NOTE: intentionally NOT wrapped in @st.cache_data. Caching a function that
+    # emits elements relies on cached-element replay, which is fragile; the CSS
+    # block is tiny so it is simply re-emitted on each run.
     bg = "#fff7ed"
     panel_warm = "#fff3e6"
     text = "#1f2937"
@@ -345,6 +350,7 @@ def inject_custom_css() -> None:
             color: {text} !important;
         }}
 
+        /* STABILIZE LIVE VIDEO CONTAINER TO PREVENT DISAPPEARING/BLINKING */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
         div[data-testid="stElementContainer"],
@@ -810,6 +816,7 @@ def inject_custom_css() -> None:
             border-radius: 50%;
         }}
 
+        /* Panels (video, stats, settings): no outline, no box, like backup.py */
         [data-testid="stVerticalBlockBorderWrapper"] {{
             background: transparent !important;
             border: none !important;
@@ -846,6 +853,9 @@ def inject_custom_css() -> None:
             color: {accent_dark};
         }}
 
+        /* Browser-camera (WebRTC) connector: kept VISIBLE and compact. Hiding it
+           (0px height / opacity 0) stops browsers from showing the camera
+           permission prompt, which is why the feed never appeared. */
         .st-key-webrtc_transport {{
             min-height: 3rem;
             overflow: visible !important;
@@ -883,6 +893,8 @@ def build_siren_wav_base64(
     high_freq: int = 1500,
     sample_rate: int = 44100,
 ) -> str:
+    # lru_cache: this used to be rebuilt (numpy + base64 of ~280 KB) on every
+    # 100 ms tick while CRITICAL.
     segment_len = max(1, int(sample_rate * duration / 4))
     t_seg = np.linspace(0, duration / 4, segment_len, False)
 
@@ -903,6 +915,7 @@ def build_siren_wav_base64(
 
 
 def play_critical_alarm(is_critical: bool) -> None:
+    """Plays continuous siren sound while severity remains CRITICAL."""
     st.session_state.alarm_active = bool(is_critical) and st.session_state.sound_enabled
 
     if not st.session_state.alarm_active:
@@ -946,6 +959,7 @@ def dispatch_hazard_alerts(severity_str: str, hazard_title: str) -> None:
         "action_line": "Please evacuate from the area immediately.",
         "checked_time": datetime.now().strftime("%H:%M:%S"),
         "triggered_at": now,
+        # CRITICAL uses the looping siren instead of the one-shot beep.
         "beep": severity_norm != "CRITICAL",
     }
 
@@ -958,6 +972,10 @@ def render_custom_hazard_toast() -> None:
     if time.time() - toast_data["triggered_at"] > CONFIG["TOAST_DISPLAY_SECONDS"]:
         return
 
+    # WEB FIX: the beep used to be emitted once, inside a fragment that re-runs
+    # every 100 ms, so the <audio> element was removed before it finished
+    # playing. It is now rendered for as long as the toast is visible; the unique
+    # id makes the browser re-mount (and so replay) it for each new alert.
     audio_html = ""
     if toast_data.get("beep") and st.session_state.sound_enabled:
         beep_id = int(toast_data["triggered_at"] * 1000)
@@ -1071,6 +1089,8 @@ if WEBRTC_AVAILABLE:
 
         @staticmethod
         def _draw_overlay(img: np.ndarray, overlay: Dict[str, Any]) -> np.ndarray:
+            # Detections are computed on a resized copy (overlay["w"] x overlay["h"]);
+            # scale them back onto the full-size frame the browser receives.
             out = img.copy()
             h, w = out.shape[:2]
             sx = w / max(overlay["w"], 1)
@@ -1204,7 +1224,12 @@ def _fetch_cloudflare_ice_servers(key_id: str, api_token: str) -> Optional[list]
                 item = dict(server)
                 item["urls"] = urls
                 filtered.append(item)
-        return filtered if filtered else None
+        if not filtered:
+            ICE_SERVER_DIAGNOSTICS["detail"] = (
+                "Cloudflare returned iceServers but every entry was filtered out."
+            )
+            return None
+        return filtered
     except Exception as exc:
         ICE_SERVER_DIAGNOSTICS["detail"] = f"Cloudflare TURN request failed: {exc}"
         return None
@@ -1246,6 +1271,11 @@ def get_ice_servers() -> list:
         ice_servers = _fetch_cloudflare_ice_servers(cf_key_id, cf_api_token)
         if ice_servers:
             ICE_SERVER_DIAGNOSTICS.update(tier="cloudflare", detail="TURN credentials minted OK.")
+    else:
+        ICE_SERVER_DIAGNOSTICS["detail"] = (
+            "CLOUDFLARE_TURN_KEY_ID / CLOUDFLARE_TURN_KEY_API_TOKEN not set "
+            "(checked env vars and st.secrets)."
+        )
 
     if not ice_servers:
         metered_key, metered_domain = _get_metered_credentials()
@@ -1278,12 +1308,27 @@ def _describe_ice_servers(ice_servers: list) -> str:
         return ":material/check_circle: Browser camera relay: Cloudflare TURN configured."
     if has_turn_credential:
         return ":material/check_circle: Browser camera relay: TURN relay configured."
-    return ":material/info: Browser camera relay: STUN only."
+    return ":material/info: Browser camera relay: STUN only (may fail behind strict networks)."
 
 
 def render_browser_camera_widget() -> None:
+    """Mounts the WebRTC connector that streams the VISITOR's webcam to the server.
+
+    Fixes for "camera doesn't display when started":
+      * SENDRECV instead of SENDONLY. In SENDONLY mode streamlit-webrtc does not
+        run the video processor, so BrowserCameraProcessor.recv() was never called
+        and the app waited forever for a first frame.
+      * The widget is visible (it used to be collapsed to 0px with opacity 0, which
+        stops browsers from showing the camera permission prompt).
+      * Removed the unsupported `media_toggle_controls` argument.
+    """
     if not WEBRTC_AVAILABLE:
-        st.error("Browser camera mode requires the `streamlit-webrtc` and `av` packages.")
+        st.error(
+            "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
+            "which are listed in requirements.txt but failed to import. Check the "
+            "deployment logs — this is usually a missing system library (see "
+            "packages.txt: libavformat-dev, libavdevice-dev, libgl1)."
+        )
         return
 
     ice_servers = get_ice_servers()
@@ -1319,13 +1364,29 @@ def render_browser_camera_widget() -> None:
     if state is not None and getattr(state, "playing", False):
         st.caption(":material/videocam: Browser camera connected.")
     else:
-        st.caption(":material/videocam: Allow camera access when prompted or press START.")
-    st.caption(_describe_ice_servers(ice_servers))
+        st.caption(
+            ":material/videocam: Allow camera access when your browser asks. "
+            "If no prompt appears, press START above."
+        )
+    ice_note = _describe_ice_servers(ice_servers)
+    if ice_note.startswith(":material/info:") and not (state is not None and getattr(state, "playing", False)):
+        st.warning(
+            "No TURN relay is configured, so a hosted app usually cannot connect to your "
+            "browser camera. Add CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_KEY_API_TOKEN "
+            "(or METERED_API_KEY + METERED_DOMAIN) to your Streamlit secrets and reboot the app.",
+            icon=":material/warning:",
+        )
+    st.caption(ice_note)
 
 
 # =============================================================================
 # MULTI-CAMERA HANDLING & 3x3 MATRIX (LOCAL DEVICES ONLY)
 # =============================================================================
+@st.cache_resource(show_spinner=False)
+def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
+    return ThreadPoolExecutor(max_workers=max(1, n_workers))
+
+
 @st.cache_resource(show_spinner=False)
 def get_camera_caps() -> Dict[int, cv2.VideoCapture]:
     caps = {}
@@ -1426,6 +1487,8 @@ class VideoCaptureManager:
             st.session_state.last_error = "Waiting for first frame from browser camera..."
             return {}, None
 
+        # Keep the camera's real aspect ratio (the old fixed 640x300 resize
+        # squashed 4:3 webcams).
         h, w = frame.shape[:2]
         target_w = CONFIG["FRAME_WIDTH"]
         target_h = max(1, int(round(h * target_w / max(w, 1))))
@@ -1455,7 +1518,10 @@ class VideoCaptureManager:
                     return idx, frame
             return idx, None
 
-        with ThreadPoolExecutor(max_workers=max(1, len(caps))) as executor:
+        if len(caps) == 1:
+            results = [_read_cam(item) for item in caps.items()]
+        else:
+            executor = _get_camera_read_executor(len(caps))
             results = list(executor.map(_read_cam, caps.items()))
 
         for idx, frame in results:
@@ -1466,16 +1532,85 @@ class VideoCaptureManager:
 
         return active_frames, primary_frame
 
+    @staticmethod
+    def placeholder_frame(message: str, subtext: str = "") -> np.ndarray:
+        frame = np.zeros(
+            (CONFIG["FRAME_HEIGHT"], CONFIG["FRAME_WIDTH"], 3),
+            dtype=np.uint8
+        )
+        frame[:] = (22, 28, 55)
+
+        cv2.putText(
+            frame,
+            message,
+            (55, 140),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            1.0,
+            (0, 255, 170),
+            2,
+        )
+
+        if subtext:
+            cv2.putText(
+                frame,
+                subtext,
+                (55, 185),
+                cv2.FONT_HERSHEY_SIMPLEX,
+                0.6,
+                (220, 220, 220),
+                1,
+            )
+
+        return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+
 
 # =============================================================================
-# IMAGE ENCODING & DETECTION PIPELINE
+# IMAGE ENCODING
 # =============================================================================
 def frame_to_base64_jpeg(frame: np.ndarray) -> str:
     encode_param = [int(cv2.IMWRITE_JPEG_QUALITY), CONFIG["JPEG_QUALITY"]]
     ok, buffer = cv2.imencode(".jpg", frame, encode_param)
+
     if not ok:
         raise ValueError("Failed to encode frame.")
+
     return base64.b64encode(buffer).decode("utf-8")
+
+
+# =============================================================================
+# YOLO FIRE & SMOKE DETECTION
+# =============================================================================
+def get_yolo_debug_info() -> Dict[str, Any]:
+    model_path = CONFIG["YOLO_MODEL_PATH"]
+    model_dir = os.path.dirname(model_path)
+
+    try:
+        dir_listing = os.listdir(model_dir) if os.path.isdir(model_dir) else []
+    except Exception as exc:
+        dir_listing = [f"<could not list directory: {exc}>"]
+
+    info = {
+        "YOLO_AVAILABLE (ultralytics imported)": YOLO_AVAILABLE,
+        "ultralytics import error": YOLO_IMPORT_ERROR or "(none)",
+        "cwd": os.getcwd(),
+        "expected model path": model_path,
+        "os.path.exists(model_path)": os.path.exists(model_path),
+        "os.path.isfile(model_path)": os.path.isfile(model_path),
+        "files in that directory": dir_listing,
+        "load_yolo_model() result": None,
+        "load exception": "(not attempted)",
+    }
+
+    if YOLO_AVAILABLE and os.path.exists(model_path):
+        try:
+            model = load_yolo_model()
+            info["load_yolo_model() result"] = "loaded OK" if model is not None else "returned None"
+            info["load exception"] = _yolo_state()["error"] or "(none)"
+        except Exception as exc:
+            info["load_yolo_model() result"] = "raised an exception"
+            info["load exception"] = f"{type(exc).__name__}: {exc}"
+
+    return info
 
 
 @st.cache_resource(show_spinner=False)
@@ -1486,8 +1621,13 @@ def _yolo_state() -> Dict[str, Any]:
 @st.cache_resource(show_spinner=False)
 def load_yolo_model():
     state = _yolo_state()
+
     if not YOLO_AVAILABLE:
-        state["error"] = "Ultralytics YOLO not available."
+        state["error"] = (
+            "The 'ultralytics' package failed to import"
+            + (f" ({YOLO_IMPORT_ERROR})" if YOLO_IMPORT_ERROR else "")
+            + ". Check it's in requirements.txt and installed in this environment."
+        )
         return None
 
     model_path = CONFIG["YOLO_MODEL_PATH"]
@@ -1500,19 +1640,31 @@ def load_yolo_model():
         state["error"] = ""
         return model
     except Exception as exc:
-        state["error"] = f"YOLO failed to load: {exc}"
+        state["error"] = f"YOLO failed to load ({type(exc).__name__}): {exc}"
         return None
+
+
+def get_yolo_load_error() -> str:
+    load_yolo_model()
+    return _yolo_state()["error"]
 
 
 def is_yolo_model_available() -> bool:
     if not YOLO_AVAILABLE:
         return False
-    return os.path.isfile(CONFIG["YOLO_MODEL_PATH"]) and load_yolo_model() is not None
+    model_path = CONFIG["YOLO_MODEL_PATH"]
+    if not os.path.isfile(model_path):
+        return False
+    return load_yolo_model() is not None
 
 
 class YOLOFireSmokeDetector:
     def __init__(self) -> None:
         self.model = load_yolo_model()
+
+    @property
+    def available(self) -> bool:
+        return self.model is not None
 
     def detect(self, frame: np.ndarray) -> Dict[str, Any]:
         empty = {
@@ -1522,6 +1674,7 @@ class YOLOFireSmokeDetector:
             "classes": [],
             "annotated_frame": frame,
         }
+
         if frame is None or self.model is None:
             return empty
 
@@ -1533,6 +1686,7 @@ class YOLOFireSmokeDetector:
                 verbose=False,
                 device="cpu",
             )
+
             if not results:
                 return empty
 
@@ -1544,7 +1698,12 @@ class YOLOFireSmokeDetector:
                 for box in result.boxes:
                     cls_id = int(box.cls[0].item())
                     confidence = float(box.conf[0].item())
-                    class_name = str(names.get(cls_id, cls_id)).lower() if isinstance(names, dict) else str(names[cls_id]).lower()
+
+                    if isinstance(names, dict):
+                        class_name = str(names.get(cls_id, cls_id)).lower()
+                    else:
+                        class_name = str(names[cls_id]).lower()
+
                     xyxy = box.xyxy[0].tolist()
                     detections.append({
                         "class": class_name,
@@ -1553,22 +1712,36 @@ class YOLOFireSmokeDetector:
                     })
 
             annotated = result.plot() if detections else frame
+
             return {
                 "detected": bool(detections),
                 "detections": detections,
-                "highest_confidence": max((d["confidence"] for d in detections), default=0.0),
+                "highest_confidence": (
+                    max(d["confidence"] for d in detections)
+                    if detections else 0.0
+                ),
                 "classes": sorted(set(d["class"] for d in detections)),
                 "annotated_frame": annotated,
             }
+
         except Exception as exc:
-            empty["error"] = f"YOLO error: {exc}"
+            empty["error"] = f"YOLO detection issue: {exc}"
             return empty
+
+    def _async_worker(self, frame: np.ndarray) -> None:
+        result = self.detect(frame)
+        YOLO_RESULT_QUEUE.put(result)
 
     def trigger_async_detect(self, frame: np.ndarray) -> None:
         if st.session_state.get("yolo_detection_in_progress", False):
             return
         st.session_state.yolo_detection_in_progress = True
-        threading.Thread(target=lambda f: YOLO_RESULT_QUEUE.put(self.detect(f)), args=(frame.copy(),), daemon=True).start()
+        thread = threading.Thread(
+            target=self._async_worker,
+            args=(frame.copy(),),
+            daemon=True,
+        )
+        thread.start()
 
     @staticmethod
     def drain_worker_queue() -> None:
@@ -1580,6 +1753,9 @@ class YOLOFireSmokeDetector:
             st.session_state.yolo_detection_in_progress = False
             st.session_state.yolo_detection = result
             st.session_state.inference_count += 1
+            err = result.get("error")
+            if err:
+                st.session_state.last_error = err
 
     @staticmethod
     def draw_boxes_on_frame(frame: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
@@ -1599,46 +1775,453 @@ class YOLOFireSmokeDetector:
     def hazard_severity(yolo_result: Dict[str, Any]) -> str:
         if not yolo_result.get("detected"):
             return "NORMAL"
+
         highest = "NORMAL"
         for detection in yolo_result.get("detections", []):
             class_name = detection["class"].lower()
             confidence = detection["confidence"]
-            candidate = "CRITICAL" if "fire" in class_name and confidence >= 0.50 else "HIGH" if "fire" in class_name else "MEDIUM"
+
+            if "fire" in class_name:
+                candidate = "CRITICAL" if confidence >= 0.50 else "HIGH"
+            elif "smoke" in class_name:
+                candidate = "HIGH" if confidence >= 0.30 else "MEDIUM"
+            else:
+                continue
+
             if SEVERITY_STYLE[candidate]["score"] > SEVERITY_STYLE[highest]["score"]:
                 highest = candidate
+
         return highest
 
 
+# =============================================================================
+# VISUAL FALLBACK DETECTION
+# =============================================================================
 class VisualFireSmokeDetector:
     @staticmethod
     def detect(frame: np.ndarray) -> Dict[str, Any]:
-        return {"visual_severity": "NORMAL", "visual_keyword": "", "fire_ratio": 0.0, "smoke_ratio": 0.0}
+        if frame is None or frame.size == 0:
+            return {
+                "visual_severity": "NORMAL",
+                "visual_keyword": "",
+                "fire_ratio": 0.0,
+                "smoke_ratio": 0.0,
+            }
+
+        bgr = frame
+        hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
+        ycrcb = cv2.cvtColor(bgr, cv2.COLOR_BGR2YCrCb)
+
+        b, g, r = cv2.split(bgr)
+        h, s, v = cv2.split(hsv)
+
+        lower_skin = np.array([0, 133, 77], dtype=np.uint8)
+        upper_skin = np.array([255, 173, 127], dtype=np.uint8)
+        skin_mask = cv2.inRange(ycrcb, lower_skin, upper_skin)
+
+        red_or_orange_hue = ((h <= 18) | (h >= 172))
+        bright_saturated = (s >= 160) & (v >= 200)
+        rgb_dominance = (r > 190) & (r > g * 1.25) & (r > b * 1.85) & (g > 60)
+        non_skin = skin_mask == 0
+
+        fire_pixels = red_or_orange_hue & bright_saturated & rgb_dominance & non_skin
+        fire_mask = fire_pixels.astype(np.uint8) * 255
+
+        kernel = np.ones((5, 5), np.uint8)
+        fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_OPEN, kernel)
+        fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_DILATE, kernel)
+
+        low_saturation = s < 35
+        mid_brightness = (v > 110) & (v < 200)
+        gray_dominance = (
+            (np.abs(r.astype(int) - g.astype(int)) < 18)
+            & (np.abs(g.astype(int) - b.astype(int)) < 18)
+        )
+
+        smoke_pixels = low_saturation & mid_brightness & gray_dominance
+        smoke_mask = smoke_pixels.astype(np.uint8) * 255
+
+        total_pixels = frame.shape[0] * frame.shape[1]
+        fire_ratio = float(cv2.countNonZero(fire_mask)) / total_pixels
+        smoke_ratio = float(cv2.countNonZero(smoke_mask)) / total_pixels
+
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+            fire_mask,
+            connectivity=8,
+        )
+
+        largest_fire_area = 0
+        if num_labels > 1:
+            largest_fire_area = int(stats[1:, cv2.CC_STAT_AREA].max())
+
+        largest_fire_ratio = largest_fire_area / total_pixels
+        keyword = ""
+
+        if fire_ratio >= 0.050 and largest_fire_ratio >= 0.040:
+            severity = "CRITICAL"
+            keyword = "visual_fire_critical"
+        elif fire_ratio >= 0.025 and largest_fire_ratio >= 0.020:
+            severity = "HIGH"
+            keyword = "visual_fire_high"
+        elif fire_ratio >= 0.010:
+            severity = "MEDIUM"
+            keyword = "visual_fire_medium"
+        elif smoke_ratio >= 0.35:
+            severity = "CRITICAL"
+            keyword = "visual_smoke_critical"
+        elif smoke_ratio >= 0.20:
+            severity = "HIGH"
+            keyword = "visual_smoke_high"
+        elif smoke_ratio >= 0.10:
+            severity = "MEDIUM"
+            keyword = "visual_smoke_medium"
+        else:
+            severity = "NORMAL"
+            keyword = ""
+
+        return {
+            "visual_severity": severity,
+            "visual_keyword": keyword,
+            "fire_ratio": fire_ratio,
+            "smoke_ratio": smoke_ratio,
+        }
 
 
+# =============================================================================
+# OLLAMA VLM INFERENCE
+# =============================================================================
 class VLMInference:
     @staticmethod
+    def _async_worker(frame: np.ndarray, token_budget: int, host: Optional[str]) -> None:
+        try:
+            image_b64 = frame_to_base64_jpeg(frame)
+            client = ollama.Client(host=host) if host else ollama.Client()
+            response = client.chat(
+                model=CONFIG["VLM_MODEL"],
+                messages=[
+                    {
+                        "role": "user",
+                        "content": (
+                            "Analyze this camera frame for fire and smoke only. "
+                            "Return exactly one category: NORMAL, MEDIUM, HIGH, or CRITICAL. "
+                            "Use NORMAL when there is no visible fire or smoke. "
+                            "Use MEDIUM only for light smoke or unclear early warning. "
+                            "Use HIGH for visible flame, burning object, or clear smoke. "
+                            "Use CRITICAL only for active fire, heavy smoke, visible flames, explosion, or immediate danger. "
+                            "Do not classify people, skin, red clothing, walls, posters, or warm lighting as fire. "
+                            "Start with the category, then one short reason."
+                        ),
+                        "images": [image_b64],
+                    }
+                ],
+                options={
+                    "num_ctx": token_budget,
+                    "num_predict": 80,
+                    "temperature": 0.0,
+                },
+            )
+
+            text = response.get("message", {}).get("content", "").strip()
+            if text:
+                VLM_RESULT_QUEUE.put({"success": True, "text": text, "error": ""})
+            else:
+                VLM_RESULT_QUEUE.put({"success": False, "text": "", "error": "Ollama returned empty response."})
+        except Exception as exc:
+            VLM_RESULT_QUEUE.put({"success": False, "text": "", "error": f"Ollama backend issue: {exc}"})
+
+    @staticmethod
     def trigger_async_inference(frame: np.ndarray) -> None:
-        pass
+        if not OLLAMA_AVAILABLE:
+            st.session_state.last_error = "Ollama Python package is not installed."
+            return
+
+        if st.session_state.get("vlm_in_progress", False):
+            return
+
+        # WEB FIX: Ollama on "localhost" only exists on your own machine. On a
+        # hosted deployment, set OLLAMA_HOST (env var or secret) to a reachable
+        # server (e.g. http://my-vps:11434); without it the VLM step is skipped
+        # and detection continues with YOLO + the OpenCV fallback.
+        host = _get_secret("OLLAMA_HOST")
+        if is_cloud_environment() and not host:
+            return
+
+        st.session_state.vlm_in_progress = True
+        token_budget = ResourceGovernor.recommended_token_budget()
+        thread = threading.Thread(
+            target=VLMInference._async_worker,
+            args=(frame.copy(), token_budget, host),
+            daemon=True
+        )
+        thread.start()
 
     @staticmethod
     def drain_worker_queue() -> None:
-        pass
+        while not VLM_RESULT_QUEUE.empty():
+            try:
+                res = VLM_RESULT_QUEUE.get_nowait()
+                st.session_state.vlm_in_progress = False
+                if res["success"]:
+                    st.session_state.latest_vlm_text = res["text"]
+                    st.session_state.inference_count += 1
+                    st.session_state.last_error = ""
+                else:
+                    st.session_state.last_error = res["error"]
+            except queue.Empty:
+                break
 
 
+# =============================================================================
+# YARA VERIFICATION
+# =============================================================================
 @st.cache_resource(show_spinner=False)
 def compile_yara_rules():
-    if not YARA_AVAILABLE or not os.path.exists(CONFIG["YARA_RULE_PATH"]):
+    if not YARA_AVAILABLE:
         return None
+
+    if not os.path.exists(CONFIG["YARA_RULE_PATH"]):
+        return None
+
     return yara.compile(filepath=CONFIG["YARA_RULE_PATH"])
 
 
 class YARAVerifier:
     @staticmethod
     def verify(vlm_text: str, visual_result: Dict[str, Any]) -> Dict[str, Any]:
+        yara_severity = "NORMAL"
+        matched_rule = "no_yara_match"
+        matched_source = "YARA_TEXT"
+
+        if YARA_AVAILABLE and vlm_text:
+            try:
+                rules = compile_yara_rules()
+                matches = rules.match(data=vlm_text.encode("utf-8", errors="ignore")) if rules else []
+
+                if matches:
+                    highest_score = -1
+                    for match in matches:
+                        severity = match.meta.get("severity", "NORMAL")
+                        score = SEVERITY_STYLE.get(severity, SEVERITY_STYLE["NORMAL"])["score"]
+
+                        if score > highest_score:
+                            highest_score = score
+                            yara_severity = severity
+                            matched_rule = match.rule
+
+            except Exception:
+                yara_severity = "NORMAL"
+                matched_rule = "yara_verification_unavailable"
+        else:
+            matched_rule = "yara_not_installed" if not YARA_AVAILABLE else "no_vlm_text"
+
+        visual_severity = visual_result.get("visual_severity", "NORMAL")
+        yara_score = SEVERITY_STYLE[yara_severity]["score"]
+        visual_score = SEVERITY_STYLE[visual_severity]["score"]
+
+        if visual_score > yara_score:
+            final_severity = visual_severity
+            matched_source = "OPENCV_VISUAL_FALLBACK"
+            matched_keyword = visual_result.get("visual_keyword", "visual_detection")
+        else:
+            final_severity = yara_severity
+            matched_keyword = matched_rule
+
+        is_hazard = final_severity != "NORMAL"
+        confidence = {
+            "NORMAL": 0.10,
+            "MEDIUM": 0.64,
+            "HIGH": 0.82,
+            "CRITICAL": 0.92,
+        }[final_severity]
+
         return {
+            "severity": final_severity,
+            "is_hazard": is_hazard,
+            "confidence": confidence,
+            "matched_keyword": matched_keyword,
+            "matched_source": matched_source,
+            "yara_severity": yara_severity,
+            "visual_severity": visual_severity,
+            "fire_ratio": visual_result.get("fire_ratio", 0.0),
+            "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
+            "yara_available": YARA_AVAILABLE,
+        }
+
+
+# =============================================================================
+# GOOGLE CLOUD FORENSIC BACKUP & LOCAL BUFFER
+# =============================================================================
+def _queue_image_for_later_upload(frame: np.ndarray, alert: Dict[str, Any]) -> None:
+    try:
+        pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
+        os.makedirs(pending_dir, exist_ok=True)
+
+        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        severity = alert.get("severity", "UNKNOWN")
+        base_name = f"{severity}_{stamp}"
+
+        ok, buffer = cv2.imencode(".jpg", frame)
+        if not ok:
+            return
+
+        with open(os.path.join(pending_dir, f"{base_name}.jpg"), "wb") as f:
+            f.write(buffer.tobytes())
+
+        with open(os.path.join(pending_dir, f"{base_name}.json"), "w") as f:
+            json.dump(alert, f, default=str)
+    except Exception:
+        pass
+
+
+def flush_pending_cloud_uploads() -> None:
+    if not GCP_AVAILABLE or storage is None:
+        return
+    if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+        return
+
+    pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
+    if not os.path.isdir(pending_dir):
+        return
+
+    try:
+        client, _ = get_gcp_clients()
+        if client is None:
+            return
+        bucket = client.bucket(CONFIG["GCP_BUCKET"])
+    except Exception:
+        return
+
+    for filename in sorted(os.listdir(pending_dir)):
+        if not filename.endswith(".jpg"):
+            continue
+
+        base_name = filename[:-4]
+        image_path = os.path.join(pending_dir, filename)
+        meta_path = os.path.join(pending_dir, f"{base_name}.json")
+
+        try:
+            with open(image_path, "rb") as f:
+                image_bytes = f.read()
+
+            bucket.blob(f"cybervision_alerts/{base_name}.jpg").upload_from_string(
+                image_bytes, content_type="image/jpeg"
+            )
+
+            if os.path.isfile(meta_path):
+                with open(meta_path, "r") as f:
+                    meta_text = f.read()
+                bucket.blob(f"cybervision_alerts/{base_name}.json").upload_from_string(
+                    meta_text, content_type="application/json"
+                )
+                os.remove(meta_path)
+
+            os.remove(image_path)
+        except Exception:
+            continue
+
+
+def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud_sync_enabled: bool) -> None:
+    # WEB FIX: `cloud_sync_enabled` is read on the Streamlit script thread and
+    # passed in. The old worker read st.session_state from a plain background
+    # thread, which has no session context, so the cloud upload never ran.
+    def _worker():
+        save_event_locally(
+            time.time(),
+            alert.get("severity", "UNKNOWN"),
+            alert.get("description", ""),
+            camera_id="CAM_01"
+        )
+
+        if not cloud_sync_enabled or not GCP_AVAILABLE or storage is None:
+            return
+
+        if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+            return
+
+        if not is_wifi_connected():
+            _queue_image_for_later_upload(frame, alert)
+            return
+
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            severity = alert.get("severity", "UNKNOWN")
+
+            image_name = f"cybervision_alerts/{severity}_{timestamp}.jpg"
+            log_name = f"cybervision_alerts/{severity}_{timestamp}.json"
+
+            ok, buffer = cv2.imencode(".jpg", frame)
+            if not ok:
+                return
+
+            client, _ = get_gcp_clients()
+            if client is None:
+                _queue_image_for_later_upload(frame, alert)
+                return
+            bucket = client.bucket(CONFIG["GCP_BUCKET"])
+
+            bucket.blob(image_name).upload_from_string(buffer.tobytes(), content_type="image/jpeg")
+            bucket.blob(log_name).upload_from_string(
+                json.dumps(alert, default=str), content_type="application/json"
+            )
+        except Exception:
+            _queue_image_for_later_upload(frame, alert)
+
+    threading.Thread(target=_worker, daemon=True).start()
+
+
+# =============================================================================
+# HELPER FUNCTIONS
+# =============================================================================
+def determine_hazard_title(latest: Dict[str, Any]) -> str:
+    if not latest or latest.get("severity") == "NORMAL":
+        return "Environment is Safe"
+
+    classes = [c.strip().lower() for c in latest.get("yolo_classes", "").split(",") if c.strip()]
+    description = latest.get("description", "").lower()
+    keyword = str(latest.get("matched_keyword", "")).lower()
+
+    has_fire = (
+        any("fire" in item for item in classes)
+        or "fire" in description
+        or "fire" in keyword
+        or latest.get("fire_ratio", 0) > 0.010
+    )
+
+    has_smoke = (
+        any("smoke" in item for item in classes)
+        or "smoke" in description
+        or "smoke" in keyword
+        or latest.get("smoke_ratio", 0) > 0.10
+    )
+
+    if has_fire:
+        return "Fire Detected"
+    if has_smoke:
+        return "Smoke Detected"
+
+    if "fire" in description or "fire" in keyword:
+        return "Fire Detected"
+
+    return "Smoke Detected"
+
+
+# =============================================================================
+# DETECTION PIPELINE
+# =============================================================================
+def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
+    if frame is None or frame.size == 0:
+        default_alert = {
+            "timestamp": datetime.now().strftime("%H:%M:%S"),
+            "description": "NORMAL: Camera stream starting...",
+            "success": True,
+            "latency": 0.0,
+            "verified": False,
+            "yolo_detected": False,
+            "yolo_classes": "",
+            "yolo_confidence": 0.0,
             "severity": "NORMAL",
             "is_hazard": False,
-            "confidence": 0.10,
+            "confidence": 0.0,
             "matched_keyword": "none",
             "matched_source": "SYSTEM",
             "yara_severity": "NORMAL",
@@ -1647,45 +2230,124 @@ class YARAVerifier:
             "smoke_ratio": 0.0,
             "yara_available": YARA_AVAILABLE,
         }
-
-
-def flush_pending_cloud_uploads() -> None:
-    pass
-
-
-def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud_sync_enabled: bool) -> None:
-    pass
-
-
-def determine_hazard_title(latest: Dict[str, Any]) -> str:
-    return "Environment is Safe"
-
-
-def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
-    if frame is None or frame.size == 0:
+        play_critical_alarm(False)
+        st.session_state.yolo_severity = "NORMAL"
         return {
             "annotated_frame": frame,
             "yolo": {"detected": False, "detections": []},
-            "alert": {"severity": "NORMAL", "is_hazard": False},
+            "alert": default_alert,
         }
 
+    ResourceGovernor.check_resource_pressure()
+    start_time = time.time()
+
+    VLMInference.drain_worker_queue()
+
+    # 1. Primary Object Detection (YOLO)
     yolo_detector = st.session_state.get("yolo_detector")
     if yolo_detector is None:
         yolo_detector = YOLOFireSmokeDetector()
         st.session_state.yolo_detector = yolo_detector
 
     yolo_detector.drain_worker_queue()
-    if st.session_state.get("yolo_detection") is None or st.session_state.frames_processed % CONFIG["YOLO_EVERY_N_FRAMES"] == 0:
+
+    frame_number = st.session_state.frames_processed
+    run_yolo_now = (
+        st.session_state.get("yolo_detection") is None
+        or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"]) == 0
+    )
+
+    if run_yolo_now:
         yolo_detector.trigger_async_detect(frame)
 
-    yolo_result = st.session_state.get("yolo_detection") or {"detected": False, "detections": [], "annotated_frame": frame}
-    yolo_severity = yolo_detector.hazard_severity(yolo_result)
+    yolo_result = st.session_state.get("yolo_detection") or {
+        "detected": False, "detections": [], "highest_confidence": 0.0,
+        "classes": [], "annotated_frame": frame,
+    }
+
+    yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
     st.session_state.yolo_severity = yolo_severity
+
+    run_visual_now = (
+        st.session_state.get("last_visual_result") is None
+        or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"]) == 0
+    )
+    if run_visual_now:
+        visual_result = VisualFireSmokeDetector.detect(frame)
+        st.session_state.last_visual_result = visual_result
+    else:
+        visual_result = st.session_state.last_visual_result
+
+    candidate_hazard = yolo_result.get("detected", False)
+    analyze_this_frame = (
+        candidate_hazard
+        and frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
+    )
+
+    if analyze_this_frame:
+        VLMInference.trigger_async_inference(frame)
+
+    vlm_text = st.session_state.get("latest_vlm_text", "")
+    if not vlm_text:
+        vlm_text = "NORMAL: Monitoring active."
+
+    verdict = YARAVerifier.verify(vlm_text, visual_result)
+
+    latency = time.time() - start_time
+    st.session_state.latency_history.append(latency)
+
+    public_description = vlm_text
+    if yolo_result.get("detected"):
+        detection_text = ", ".join(f"{d['class']} {d['confidence']:.0%}" for d in yolo_result["detections"])
+        public_description = f"YOLO detected: {detection_text}. VLM: {vlm_text}"
+
+    is_hazard = yolo_result.get("detected", False)
+    confidence = yolo_result.get("highest_confidence", 0.0) if is_hazard else 0.0
+
+    alert = {
+        "timestamp": datetime.now().strftime("%H:%M:%S"),
+        "description": public_description,
+        "success": True,
+        "latency": latency,
+        "verified": is_hazard,
+        "yolo_detected": is_hazard,
+        "yolo_classes": ", ".join(yolo_result.get("classes", [])),
+        "yolo_confidence": confidence,
+        "severity": yolo_severity,
+        "is_hazard": is_hazard,
+        "confidence": confidence,
+        "matched_keyword": verdict.get("matched_keyword", "none"),
+        "matched_source": "YOLO_DETECTOR" if is_hazard else "SYSTEM",
+        "yara_severity": verdict.get("yara_severity", "NORMAL"),
+        "visual_severity": visual_result.get("visual_severity", "NORMAL"),
+        "fire_ratio": visual_result.get("fire_ratio", 0.0),
+        "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
+        "yara_available": YARA_AVAILABLE,
+    }
+
+    st.session_state.alert_history.append(alert)
+    st.session_state.latest_detection = alert
+
+    if yolo_severity != "NORMAL":
+        hazard_title = determine_hazard_title(alert)
+        dispatch_hazard_alerts(yolo_severity, hazard_title)
+
+    play_critical_alarm(yolo_severity == "CRITICAL")
+
+    # WEB FIX: throttle uploads. At ~10 ticks/second this used to write a
+    # SQLite row + Firestore doc + bucket objects for every single frame.
+    if is_hazard:
+        now = time.time()
+        if now - st.session_state.get("last_cloud_upload_ts", 0.0) >= CONFIG["CLOUD_UPLOAD_MIN_INTERVAL_SEC"]:
+            st.session_state.last_cloud_upload_ts = now
+            upload_to_google_cloud_async(
+                frame, dict(alert), bool(st.session_state.cloud_sync_enabled)
+            )
 
     return {
         "annotated_frame": yolo_result.get("annotated_frame", frame),
         "yolo": yolo_result,
-        "alert": {"severity": yolo_severity, "is_hazard": yolo_result.get("detected", False)},
+        "alert": alert,
     }
 
 
@@ -1694,6 +2356,7 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
 # =============================================================================
 def render_sidebar_profile() -> None:
     st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
+
     user_name = getattr(st.user, "name", None) or "Signed in"
     user_email = getattr(st.user, "email", "") or ""
     user_picture = getattr(st.user, "picture", None)
@@ -1723,6 +2386,7 @@ def render_sidebar_profile() -> None:
 
 def render_login_page() -> None:
     inject_custom_css()
+
     st.markdown("<div style='height: 12vh;'></div>", unsafe_allow_html=True)
     _, mid, _ = st.columns([1, 1.3, 1])
 
@@ -1747,7 +2411,11 @@ def render_login_page() -> None:
             try:
                 st.login("google")
             except Exception as exc:
-                st.error(f"Google sign-in error: {exc}")
+                st.error(
+                    "Google sign-in isn't configured yet. Add an [auth] / "
+                    "[auth.google] section with your OAuth client credentials to "
+                    f".streamlit/secrets.toml (see secrets.toml.example). Details: {exc}"
+                )
 
 
 def render_sidebar_nav() -> None:
@@ -1787,6 +2455,7 @@ def render_sidebar_nav() -> None:
         st.markdown("<div class='sidebar-footer-divider'></div>", unsafe_allow_html=True)
         st.markdown("<div class='nav-section-label'>Workspace</div>", unsafe_allow_html=True)
 
+        # "Export Reports" now lives inside the Data Logs tab.
         nav_items = [
             ("Dashboard", "dashboard"),
             ("Analytics", "bar_chart"),
@@ -1812,24 +2481,88 @@ def render_sidebar_nav() -> None:
 def render_dashboard_settings_panel() -> None:
     with st.container():
         st.markdown("<div class='stats-panel-title'>Server Setup</div>", unsafe_allow_html=True)
-        st.session_state.sound_enabled = st.toggle("Alert sound", value=st.session_state.sound_enabled)
-        st.session_state.cloud_sync_enabled = st.toggle("Data synced to cloud", value=st.session_state.cloud_sync_enabled)
+
+        st.session_state.sound_enabled = st.toggle(
+            "Alert sound",
+            value=st.session_state.sound_enabled,
+        )
+
+        wifi_online = is_wifi_connected()
+        sync_label = (
+            "Data synced _to cloud_"
+            if (st.session_state.cloud_sync_enabled and wifi_online)
+            else "Data synced _locally_"
+        )
+        st.session_state.cloud_sync_enabled = st.toggle(
+            sync_label,
+            value=st.session_state.cloud_sync_enabled,
+        )
+
+        if st.session_state.cloud_sync_enabled:
+            if not GCP_AVAILABLE:
+                st.caption(":material/error: `google-cloud-firestore` / `google-cloud-storage` not installed.")
+            elif CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+                st.caption(":material/warning: Set CONFIG[\"GCP_BUCKET\"] / GCP_PROJECT_ID in main.py.")
+            elif _get_gcp_service_account_info() is None:
+                st.caption(":material/warning: No GCP credentials found (secrets, env var, or key file).")
+            else:
+                st.caption(":material/check_circle: GCP credentials loaded.")
+
+        timeout_option = st.selectbox(
+            "Inference timeout target",
+            ["1.0s", "2.0s", "3.0s", "5.0s"],
+            index=1,
+            key="inference_timeout_select"
+        )
+        CONFIG["INFERENCE_TIMEOUT"] = float(timeout_option.replace("s", ""))
+
+        st.markdown("<div style='height: 0.3rem;'></div>", unsafe_allow_html=True)
+        st.markdown("<div class='stats-panel-title'>Resources</div>", unsafe_allow_html=True)
 
         metrics = SystemMonitor.get_metrics()
         cpu_high = metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
         ram_high = metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
+        cpu_delta = ":material/check_circle:" if metrics["cpu"] < 70 else ":material/warning:" if not cpu_high else ":material/error:"
+        ram_delta = ":material/check_circle:" if metrics["ram"] < 70 else ":material/warning:" if not ram_high else ":material/error:"
 
         m1, m2 = st.columns(2)
         with m1:
-            st.metric("CPU", f"{metrics['cpu']:.1f}%")
+            with st.container(key="cpu_metric_high" if cpu_high else "cpu_metric_normal"):
+                st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
         with m2:
-            st.metric("RAM", f"{metrics['ram']:.1f}%")
+            with st.container(key="ram_metric_high" if ram_high else "ram_metric_normal"):
+                st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
+
+        if st.session_state.latency_history:
+            avg_latency = sum(st.session_state.latency_history) / len(st.session_state.latency_history)
+            st.metric("Avg Latency", f"{avg_latency * 1000:.0f} ms")
+        else:
+            st.metric("Avg Latency", "—")
+
+        if st.session_state.last_error:
+            st.info("Model/YARA backend notice: Active fallback running.")
+
+        if not is_yolo_model_available():
+            with st.expander(":material/error: YOLO not active — details", expanded=True):
+                for label, value in get_yolo_debug_info().items():
+                    st.text(f"{label}: {value}")
 
 
+# =============================================================================
+# DASHBOARD COMPONENTS
+# =============================================================================
 def render_dashboard_header() -> None:
     cam_running = st.session_state.camera_running
-    pill_text, pill_color = ("ACTIVE MODE", "#16a34a") if cam_running else ("STANDBY", "#6b7280")
+    yolo_ready = is_yolo_model_available()
 
+    if cam_running and yolo_ready:
+        pill_text, pill_color = "YOLO ACTIVE", "#16a34a"
+    elif cam_running:
+        pill_text, pill_color = "FALLBACK MODE", "#ca8a04"
+    else:
+        pill_text, pill_color = "STANDBY", "#6b7280"
+
+    # (The old markup had two stray closing </div> tags that broke the layout.)
     st.markdown(
         f"""
         <div class="dash-header">
@@ -1848,15 +2581,24 @@ def render_dashboard_header() -> None:
 
 
 def _render_live_stats_body() -> None:
+    latest = st.session_state.get("latest_detection") or {}
+
     severity = str(st.session_state.get("yolo_severity", "NORMAL")).upper()
+    if severity not in SEVERITY_STYLE:
+        severity = "NORMAL"
+
     total = len(st.session_state.alert_history)
     hazards = sum(1 for item in st.session_state.alert_history if item["is_hazard"])
+    confidence = (latest.get("confidence", 0) * 100 if latest else 0)
 
     with st.container():
         st.markdown("<div class='stats-panel-title'>Active Monitoring</div>", unsafe_allow_html=True)
+
         r1c1, r1c2 = st.columns(2)
-        r1c1.metric("Severity", severity)
-        r1c2.metric("Confidence", "10%")
+        with r1c1:
+            with st.container(key=f"severity_metric_{severity.lower()}"):
+                st.metric("Severity", severity)
+        r1c2.metric("Confidence", f"{confidence:.0f}%")
 
         r2c1, r2c2 = st.columns(2)
         r2c1.metric("Frames", st.session_state.frames_processed)
@@ -1870,11 +2612,17 @@ def render_live_stats_panel() -> None:
 
 def render_video_status_bar() -> None:
     fps = st.session_state.get("fps", 0.0)
+    avg_latency = (
+        sum(st.session_state.latency_history) / len(st.session_state.latency_history)
+        if st.session_state.latency_history else 0.0
+    )
     resolution = f"{CONFIG['FRAME_WIDTH']}x{CONFIG['FRAME_HEIGHT']}"
+
     st.markdown(
         f"""
         <div class="video-status-bar muted">
             <span>RESOLUTION: <b>{resolution}</b></span>
+            <span>INFERENCE: <b>{avg_latency * 1000:.0f} ms</b></span>
             <span>FPS: <b>{fps:.1f}</b></span>
         </div>
         """,
@@ -1882,84 +2630,311 @@ def render_video_status_bar() -> None:
     )
 
 
+def render_resource_trend_preview() -> None:
+    metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
+    if metrics_df.empty:
+        st.info("No resource metrics yet.")
+        return
+    metrics_df = metrics_df.set_index("time")
+    st.line_chart(metrics_df[["cpu", "ram"]], height=180)
+
+
+# =============================================================================
+# LIVE VIDEO STREAM
+# =============================================================================
+def _show_frame(slot, image, **kwargs) -> None:
+    """Draw an image into a slot; works on old and new Streamlit versions."""
+    try:
+        slot.image(image, width="stretch", **kwargs)
+    except Exception:
+        slot.image(image, use_container_width=True, **kwargs)
+
+
 @st.fragment(run_every=0.1)
 def live_camera_fragment() -> None:
+    # The frame/status slots are created INSIDE the fragment. A placeholder
+    # created outside and passed in raises StreamlitInvalidLayoutContextError when
+    # the fragment reruns on its own (run_every).
     frame_slot = st.empty()
     status_slot = st.empty()
+
+    def _redraw_last_frame() -> None:
+        last = st.session_state.get("last_frame_rgb")
+        if last is not None:
+            _show_frame(frame_slot, last, channels="RGB", output_format="JPEG")
 
     render_custom_hazard_toast()
 
     if not st.session_state.get("camera_running", False):
         return
 
-    use_webrtc = bool(st.session_state.get("use_webrtc"))
-    active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
-
-    if primary_frame is None and not active_frames:
-        if not use_webrtc:
-            frame_slot.image(create_blank_tile(640, 300, "Starting Camera..."), channels="RGB")
-        status_slot.error(st.session_state.get("last_error") or "Camera unavailable.")
+    if st.session_state.get("_frame_processing_busy"):
+        if not st.session_state.get("use_webrtc"):
+            _redraw_last_frame()
         return
 
-    st.session_state.frames_processed += 1
-    pipeline_result = run_detection_pipeline(primary_frame)
-    yolo_result = pipeline_result.get("yolo", {})
+    st.session_state._frame_processing_busy = True
+    try:
+        use_webrtc = bool(st.session_state.get("use_webrtc"))
+        active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
-    if 0 in active_frames and primary_frame is not None:
-        active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(primary_frame, yolo_result)
+        if primary_frame is None and not active_frames:
+            # WEB FIX: while the browser camera is still connecting, show a clear
+            # "starting" tile (not a blank area) and an info message (not an error).
+            if not use_webrtc:
+                if st.session_state.get("last_frame_rgb") is not None:
+                    _redraw_last_frame()
+                else:
+                    _show_frame(
+                        frame_slot,
+                        VideoCaptureManager.placeholder_frame(
+                            "Starting camera...",
+                            "Allow camera access in your browser.",
+                        ),
+                        channels="RGB",
+                        output_format="JPEG",
+                    )
+            message = st.session_state.get("last_error") or "Camera unavailable."
+            if use_webrtc:
+                status_slot.info(message)
+            else:
+                status_slot.error(message)
+            return
 
-    if use_webrtc:
-        display = active_frames.get(0, primary_frame)
-    else:
-        display = construct_3x3_grid(active_frames)
+        current_time = time.time()
+        last_time = st.session_state.get("last_frame_time", current_time)
+        fps = 1 / max(current_time - last_time, 0.001)
 
-    display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
-    st.session_state.last_frame_rgb = display_rgb
+        st.session_state.fps = fps
+        st.session_state.last_frame_time = current_time
+        st.session_state.frames_processed += 1
 
-    if use_webrtc:
-        ctx = st.session_state.get("webrtc_ctx")
-        if ctx and ctx.video_processor:
-            ctx.video_processor.set_overlay(yolo_result, primary_frame.shape[1], primary_frame.shape[0], ("YOLO Active", "Status: OK"))
-        status_slot.empty()
-    else:
-        frame_slot.image(display_rgb, channels="RGB", output_format="JPEG")
+        pipeline_result = run_detection_pipeline(primary_frame)
+        yolo_result = pipeline_result.get("yolo", {})
+
+        if 0 in active_frames and primary_frame is not None:
+            active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(primary_frame, yolo_result)
+
+        if use_webrtc:
+            # A visitor has exactly one webcam: show it full-width instead of one
+            # live tile surrounded by eight "NO CAMERA" tiles.
+            display = active_frames[0].copy()
+        else:
+            display = construct_3x3_grid(active_frames)
+
+        severity = st.session_state.get("yolo_severity", "NORMAL")
+        yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
+
+        hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
+        hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
+
+        overlay = display.copy()
+        cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.50, display, 0.50, 0, display)
+
+        cv2.putText(display, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+        cv2.putText(display, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+
+        display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
+        st.session_state.last_frame_rgb = display_rgb
+
+        if use_webrtc:
+            # The visitor's own <video> element is the live display. Hand the
+            # latest detections to the processor so boxes + HUD are drawn onto
+            # the stream itself (no per-frame image upload to the browser).
+            ctx = st.session_state.get("webrtc_ctx")
+            processor = getattr(ctx, "video_processor", None)
+            if processor is not None:
+                processor.set_overlay(
+                    yolo_result,
+                    int(primary_frame.shape[1]),
+                    int(primary_frame.shape[0]),
+                    (hud_line_1, hud_line_2),
+                )
+            status_slot.empty()
+        else:
+            # JPEG encodes far faster and more consistently than the default PNG.
+            _show_frame(frame_slot, display_rgb, channels="RGB", output_format="JPEG")
+    finally:
+        st.session_state._frame_processing_busy = False
 
 
 def render_video_feed() -> None:
-    btn_col1, btn_col2 = st.columns([1, 1])
+    header_col, btn_col1, btn_col2 = st.columns([6, 1, 1])
 
     with btn_col1:
         if st.button("Start", icon=":material/play_arrow:", use_container_width=True, disabled=st.session_state.camera_running, key="start_cam_btn"):
             st.session_state.camera_running = True
             st.session_state.last_error = ""
-            st.session_state.yolo_detector = YOLOFireSmokeDetector()
+            st.session_state.last_vlm_candidate_frame = None
+            st.session_state.latest_vlm_text = ""
+            st.session_state.last_frame_time = time.time()
+            st.session_state.last_frame_rgb = None
+            st.session_state.latest_detection = None
+            st.session_state.yolo_severity = "NORMAL"
+            st.session_state.alarm_active = False
+            st.session_state.active_hazard_toast = None
+
+            if st.session_state.get("yolo_detector") is None:
+                st.session_state.yolo_detector = YOLOFireSmokeDetector()
+
             st.rerun()
 
     with btn_col2:
         if st.button("Stop", icon=":material/stop:", use_container_width=True, disabled=not st.session_state.camera_running, key="stop_cam_btn"):
             st.session_state.camera_running = False
+            st.session_state.yolo_severity = "NORMAL"
+            st.session_state.alarm_active = False
+            st.session_state.active_hazard_toast = None
             release_camera()
             st.rerun()
 
+    if st.session_state.get("webrtc_unavailable_on_cloud"):
+        st.error(
+            "This deployment has no local camera device, and the browser-camera "
+            "(streamlit-webrtc) packages failed to load — see the deployment logs. "
+            "Detection cannot start until that's fixed."
+        )
+
     if not st.session_state.camera_running:
         video_placeholder = st.empty()
-        video_placeholder.image(create_blank_tile(640, 300, "Camera Stopped"), channels="RGB")
+        if st.session_state.get("last_frame_rgb") is not None:
+            _show_frame(video_placeholder, st.session_state.last_frame_rgb)
+        else:
+            _show_frame(
+                video_placeholder,
+                VideoCaptureManager.placeholder_frame("Camera Stopped", "Click Start to begin monitoring."),
+            )
         st.info("Camera is stopped. Detection paused.")
         return
 
+    # The WebRTC connector is only mounted while the camera is running, so
+    # pressing Stop also releases the visitor's webcam.
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget()
 
     live_camera_fragment()
 
 
+# =============================================================================
+# DATA LOGS (now includes Export Reports)
+# =============================================================================
+def _build_forensic_display_df() -> Optional[pd.DataFrame]:
+    if not st.session_state.alert_history:
+        return None
+
+    df = pd.DataFrame(list(st.session_state.alert_history))
+
+    display_cols = [
+        "timestamp", "severity", "matched_source", "matched_keyword",
+        "yara_severity", "visual_severity", "confidence", "latency",
+        "fire_ratio", "smoke_ratio", "success", "description",
+        "yolo_detected", "yolo_classes", "yolo_confidence",
+    ]
+
+    display_df = df[display_cols].copy()
+    display_df["latency_ms"] = (display_df["latency"] * 1000).round(1)
+    display_df["confidence"] = ((display_df["confidence"] * 100).round(1).astype(str) + "%")
+    display_df = display_df.drop(columns=["latency"])
+    return display_df
+
+
+def render_data_logs_page() -> None:
+    display_df = _build_forensic_display_df()
+
+    header_col, export_col, reset_col = st.columns([4, 1.6, 1.2])
+    with header_col:
+        st.markdown("### Data Logs")
+        st.markdown("<p class='muted'>Full forensic event history captured by the detection pipeline.</p>", unsafe_allow_html=True)
+
+    with export_col:
+        st.markdown("<div style='height: 1.7rem;'></div>", unsafe_allow_html=True)
+        if display_df is None:
+            st.button(
+                "Export report",
+                icon=":material/download:",
+                use_container_width=True,
+                disabled=True,
+                key="export_csv_disabled_btn",
+                help="No events logged yet — nothing to export.",
+            )
+        else:
+            st.download_button(
+                "Export report",
+                icon=":material/download:",
+                data=display_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"cybervision_forensic_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv",
+                mime="text/csv",
+                use_container_width=True,
+                key="download_csv_btn",
+                help=f"Download {len(display_df)} logged events as CSV.",
+            )
+
+    with reset_col:
+        st.markdown("<div style='height: 1.7rem;'></div>", unsafe_allow_html=True)
+        if st.button("Reset logs", icon=":material/restart_alt:", use_container_width=True, key="reset_logs_btn"):
+            st.session_state.alert_history.clear()
+            st.session_state.latency_history.clear()
+            st.session_state.latest_detection = None
+            st.session_state.yolo_severity = "NORMAL"
+            st.toast("Logs reset.")
+            st.rerun()
+
+    if display_df is None:
+        st.info("No events logged yet.")
+        return
+
+    st.caption(f"{len(display_df)} events ready to export.")
+    st.dataframe(display_df.iloc[::-1], use_container_width=True, hide_index=True)
+
+
+def render_charts() -> None:
+    c1, c2 = st.columns(2)
+    metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
+
+    if not metrics_df.empty:
+        metrics_df = metrics_df.set_index("time")
+        with c1:
+            st.markdown("#### CPU/RAM Usage")
+            st.line_chart(metrics_df[["cpu", "ram"]])
+    else:
+        c1.info("No resource metrics yet.")
+
+    if st.session_state.alert_history:
+        alert_df = pd.DataFrame(list(st.session_state.alert_history))
+        severity_counts = alert_df["severity"].value_counts().reindex(["NORMAL", "MEDIUM", "HIGH", "CRITICAL"]).fillna(0)
+        with c2:
+            st.markdown("#### Severity Distribution")
+            st.bar_chart(severity_counts)
+    else:
+        c2.info("No alert statistics yet.")
+
+
+def render_analytics_page() -> None:
+    st.markdown("### Analytics")
+    st.markdown("<p class='muted'>Resource usage trends and hazard severity distribution.</p>", unsafe_allow_html=True)
+    render_charts()
+
+
 def render_dashboard_page() -> None:
+    metrics = SystemMonitor.get_metrics()
+    if metrics["cpu"] > 90.0 or metrics["ram"] > 88.0:
+        st.error(f"Critical System Load! CPU: {metrics['cpu']}% | RAM: {metrics['ram']}%. System throttling.", icon=":material/error:")
+
     render_dashboard_header()
+
     video_col, stats_col = st.columns([2.6, 1], gap="medium")
+
+    # Diagnostic switch: open the app URL with ?safe=1 to skip the camera / WebRTC
+    # widget. If the dashboard loads in safe mode, the problem is in that widget.
+    safe_mode = str(st.query_params.get("safe", "")) == "1"
 
     with video_col:
         with st.container():
-            render_video_feed()
+            if safe_mode:
+                st.info("Safe mode: camera and WebRTC are disabled for diagnostics.")
+            else:
+                render_video_feed()
             render_video_status_bar()
 
     with stats_col:
@@ -1967,17 +2942,14 @@ def render_dashboard_page() -> None:
         st.markdown("<div style='height: 0.6rem;'></div>", unsafe_allow_html=True)
         render_dashboard_settings_panel()
 
-
-def render_analytics_page() -> None:
-    st.markdown("### Analytics")
-    st.markdown("<p class='muted'>Resource usage trends and hazard severity distribution.</p>", unsafe_allow_html=True)
-
-
-def render_data_logs_page() -> None:
-    st.markdown("### Data Logs")
-    st.markdown("<p class='muted'>Full forensic event history captured by the detection pipeline.</p>", unsafe_allow_html=True)
+    st.markdown("<div style='height: 0.7rem;'></div>", unsafe_allow_html=True)
+    st.markdown("#### Live Trends")
+    render_resource_trend_preview()
 
 
+# =============================================================================
+# MAIN
+# =============================================================================
 def main() -> None:
     init_session_state()
 
@@ -1992,9 +2964,15 @@ def main() -> None:
 
     start_sync_thread()
     inject_custom_css()
+
+    # Export Reports was merged into Data Logs; keep old session state valid.
+    if st.session_state.active_page == "Export Reports":
+        st.session_state.active_page = "Data Logs"
+
     render_sidebar_nav()
 
     page = st.session_state.active_page
+
     if page == "Dashboard":
         render_dashboard_page()
     elif page == "Analytics":
@@ -2002,6 +2980,7 @@ def main() -> None:
     elif page == "Data Logs":
         render_data_logs_page()
     else:
+        st.session_state.active_page = "Dashboard"
         render_dashboard_page()
 
 
