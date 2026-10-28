@@ -63,9 +63,11 @@ except Exception:
     GCP_AVAILABLE = False
 
 try:
+    import av
     from streamlit_webrtc import webrtc_streamer, WebRtcMode, VideoProcessorBase
     WEBRTC_AVAILABLE = True
 except Exception:
+    av = None
     webrtc_streamer = None
     WebRtcMode = None
     VideoProcessorBase = object
@@ -814,13 +816,13 @@ def inject_custom_css() -> None:
             border-radius: 50%;
         }}
 
-        /* Bordered containers (video panel, stats panels): no outline, soft shadow only */
+        /* Panels (video, stats, settings): no outline, no box, like backup.py */
         [data-testid="stVerticalBlockBorderWrapper"] {{
-            background: rgba(255,255,255,0.94) !important;
+            background: transparent !important;
             border: none !important;
             outline: none !important;
-            border-radius: 18px !important;
-            box-shadow: 0 10px 26px rgba(249,115,22,0.10) !important;
+            border-radius: 0 !important;
+            box-shadow: none !important;
         }}
 
         [data-testid="stExpander"],
@@ -1065,12 +1067,50 @@ if WEBRTC_AVAILABLE:
         def __init__(self) -> None:
             self._lock = threading.Lock()
             self._latest_frame: Optional[np.ndarray] = None
+            self._overlay: Optional[Dict[str, Any]] = None
+
+        def set_overlay(self, yolo_result: Dict[str, Any], src_w: int, src_h: int, hud: Tuple[str, str]) -> None:
+            with self._lock:
+                self._overlay = {"yolo": yolo_result, "w": src_w, "h": src_h, "hud": hud}
 
         def recv(self, frame):
             img = frame.to_ndarray(format="bgr24")
             with self._lock:
                 self._latest_frame = img
-            return frame
+                overlay = self._overlay
+
+            out = img
+            if overlay is not None:
+                try:
+                    out = self._draw_overlay(img, overlay)
+                except Exception:
+                    out = img
+            return av.VideoFrame.from_ndarray(out, format="bgr24")
+
+        @staticmethod
+        def _draw_overlay(img: np.ndarray, overlay: Dict[str, Any]) -> np.ndarray:
+            # Detections are computed on a resized copy (overlay["w"] x overlay["h"]);
+            # scale them back onto the full-size frame the browser receives.
+            out = img.copy()
+            h, w = out.shape[:2]
+            sx = w / max(overlay["w"], 1)
+            sy = h / max(overlay["h"], 1)
+
+            for det in (overlay["yolo"] or {}).get("detections", []):
+                x1, y1, x2, y2 = det["box"]
+                p1 = (int(x1 * sx), int(y1 * sy))
+                p2 = (int(x2 * sx), int(y2 * sy))
+                label = f"{det['class']} {det['confidence']:.0%}"
+                cv2.rectangle(out, p1, p2, (0, 0, 255), 2)
+                cv2.putText(out, label, (p1[0], max(p1[1] - 8, 12)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+
+            shade = out.copy()
+            cv2.rectangle(shade, (10, 10), (430, 82), (0, 0, 0), -1)
+            cv2.addWeighted(shade, 0.50, out, 0.50, 0, out)
+            cv2.putText(out, overlay["hud"][0], (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+            cv2.putText(out, overlay["hud"][1], (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+            return out
 
         def get_latest_frame(self) -> Optional[np.ndarray]:
             with self._lock:
@@ -1312,7 +1352,8 @@ def render_browser_camera_widget() -> None:
                 "autoPlay": True,
                 "controls": False,
                 "muted": True,
-                "style": {"display": "none"},
+                "playsInline": True,
+                "style": {"width": "100%", "borderRadius": "12px"},
             },
             async_processing=True,
         )
@@ -1327,7 +1368,15 @@ def render_browser_camera_widget() -> None:
             ":material/videocam: Allow camera access when your browser asks. "
             "If no prompt appears, press START above."
         )
-    st.caption(_describe_ice_servers(ice_servers))
+    ice_note = _describe_ice_servers(ice_servers)
+    if ice_note.startswith(":material/info:") and not (state is not None and getattr(state, "playing", False)):
+        st.warning(
+            "No TURN relay is configured, so a hosted app usually cannot connect to your "
+            "browser camera. Add CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_KEY_API_TOKEN "
+            "(or METERED_API_KEY + METERED_DOMAIN) to your Streamlit secrets and reboot the app.",
+            icon=":material/warning:",
+        )
+    st.caption(ice_note)
 
 
 # =============================================================================
@@ -2430,7 +2479,7 @@ def render_sidebar_nav() -> None:
 
 
 def render_dashboard_settings_panel() -> None:
-    with st.container(border=True):
+    with st.container():
         st.markdown("<div class='stats-panel-title'>Server Setup</div>", unsafe_allow_html=True)
 
         st.session_state.sound_enabled = st.toggle(
@@ -2542,7 +2591,7 @@ def _render_live_stats_body() -> None:
     hazards = sum(1 for item in st.session_state.alert_history if item["is_hazard"])
     confidence = (latest.get("confidence", 0) * 100 if latest else 0)
 
-    with st.container(border=True):
+    with st.container():
         st.markdown("<div class='stats-panel-title'>Active Monitoring</div>", unsafe_allow_html=True)
 
         r1c1, r1c2 = st.columns(2)
@@ -2620,7 +2669,8 @@ def live_camera_fragment() -> None:
         return
 
     if st.session_state.get("_frame_processing_busy"):
-        _redraw_last_frame()
+        if not st.session_state.get("use_webrtc"):
+            _redraw_last_frame()
         return
 
     st.session_state._frame_processing_busy = True
@@ -2631,18 +2681,19 @@ def live_camera_fragment() -> None:
         if primary_frame is None and not active_frames:
             # WEB FIX: while the browser camera is still connecting, show a clear
             # "starting" tile (not a blank area) and an info message (not an error).
-            if st.session_state.get("last_frame_rgb") is not None:
-                _redraw_last_frame()
-            else:
-                _show_frame(
-                    frame_slot,
-                    VideoCaptureManager.placeholder_frame(
-                        "Starting camera...",
-                        "Allow camera access in your browser.",
-                    ),
-                    channels="RGB",
-                    output_format="JPEG",
-                )
+            if not use_webrtc:
+                if st.session_state.get("last_frame_rgb") is not None:
+                    _redraw_last_frame()
+                else:
+                    _show_frame(
+                        frame_slot,
+                        VideoCaptureManager.placeholder_frame(
+                            "Starting camera...",
+                            "Allow camera access in your browser.",
+                        ),
+                        channels="RGB",
+                        output_format="JPEG",
+                    )
             message = st.session_state.get("last_error") or "Camera unavailable."
             if use_webrtc:
                 status_slot.info(message)
@@ -2687,8 +2738,23 @@ def live_camera_fragment() -> None:
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = display_rgb
 
-        # JPEG encodes far faster and more consistently than the default PNG.
-        _show_frame(frame_slot, display_rgb, channels="RGB", output_format="JPEG")
+        if use_webrtc:
+            # The visitor's own <video> element is the live display. Hand the
+            # latest detections to the processor so boxes + HUD are drawn onto
+            # the stream itself (no per-frame image upload to the browser).
+            ctx = st.session_state.get("webrtc_ctx")
+            processor = getattr(ctx, "video_processor", None)
+            if processor is not None:
+                processor.set_overlay(
+                    yolo_result,
+                    int(primary_frame.shape[1]),
+                    int(primary_frame.shape[0]),
+                    (hud_line_1, hud_line_2),
+                )
+            status_slot.empty()
+        else:
+            # JPEG encodes far faster and more consistently than the default PNG.
+            _show_frame(frame_slot, display_rgb, channels="RGB", output_format="JPEG")
     finally:
         st.session_state._frame_processing_busy = False
 
@@ -2864,7 +2930,7 @@ def render_dashboard_page() -> None:
     safe_mode = str(st.query_params.get("safe", "")) == "1"
 
     with video_col:
-        with st.container(border=True):
+        with st.container():
             if safe_mode:
                 st.info("Safe mode: camera and WebRTC are disabled for diagnostics.")
             else:
