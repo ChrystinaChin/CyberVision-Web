@@ -860,13 +860,13 @@ def inject_custom_css() -> None:
             color: {accent_dark};
         }}
 
-        /* Browser-camera (WebRTC) connector: kept VISIBLE but small. The 3x3
-           grid below is the real display; this is only the transport + the
-           browser's camera-permission anchor. Hiding it completely (0px height /
-           opacity 0 / display:none) stops browsers showing the permission prompt. */
         .st-key-webrtc_transport {{
-            min-height: 2.5rem;
-            overflow: visible !important;
+            position: absolute !important;
+            width: 1px !important;
+            height: 1px !important;
+            overflow: hidden !important;
+            opacity: 0.01 !important;
+            pointer-events: none !important;
         }}
 
         .st-key-webrtc_transport video {{
@@ -1097,16 +1097,20 @@ if WEBRTC_AVAILABLE:
         def recv(self, frame):
             try:
                 img = frame.to_ndarray(format="bgr24")
-                with self._lock:
-                    self._latest_frame = img
+                # Ignore frames from a disabled/muted track (all black)
+                if img.size and float(img.mean()) > 2.0:
+                    with self._lock:
+                        self._latest_frame = img
+                        self._last_real_ts = time.time()
             except Exception:
                 pass
-            # Return the original frame: pts / time_base / format stay intact.
             return frame
 
         def get_latest_frame(self) -> Optional[np.ndarray]:
             with self._lock:
-                return None if self._latest_frame is None else self._latest_frame.copy()
+                if self._latest_frame is None or time.time() - self._last_real_ts > 2.0:
+                    return None
+                return self._latest_frame.copy()
 else:
     BrowserCameraProcessor = None
 
@@ -1367,12 +1371,13 @@ def render_browser_camera_widget() -> None:
 
     state = getattr(ctx, "state", None)
     playing = bool(state is not None and getattr(state, "playing", False))
-    if playing:
-        st.caption(":material/videocam: Browser camera connected.")
-    else:
-        st.caption(
-            ":material/videocam: Allow camera access when your browser asks. "
-            "If no prompt appears, press START above."
+    ice_note = _describe_ice_servers(ice_servers)
+    if ice_note.startswith(":material/info:") and not playing:
+        st.warning(
+            "No TURN relay is configured, so a hosted app usually cannot connect to your "
+            "browser camera. Add CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_KEY_API_TOKEN "
+            "(or METERED_API_KEY + METERED_DOMAIN) to your Streamlit secrets and reboot the app.",
+            icon=":material/warning:",
         )
     ice_note = _describe_ice_servers(ice_servers)
     if ice_note.startswith(":material/info:") and not playing:
