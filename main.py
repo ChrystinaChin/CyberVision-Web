@@ -143,7 +143,10 @@ CONFIG: Dict[str, Any] = {
     "APP_SUBTITLE": "Adaptive Context Optimization at the Edge",
     "VLM_MODEL": "moondream",
     "CAMERA_INDEX": 0,
-    "CAMERA_SOURCES": [0, 1, 2, 3, 4, 5, 6, 7, 8],  # 3x3 Grid Sources (local mode only)
+    "CAMERA_SOURCES": [0],  # Primary webcam only (same as backup.py); probing 9 devices causes phantom feeds/hangs
+    "WEBRTC_ANALYSIS_WIDTH": 320,   # browser-camera frames are analysed at this width (cheap on small servers)
+    "WEBRTC_TICK_SEC": 0.25,        # detection tick in browser-camera mode (video itself is not tied to this)
+    "CAMERA_CONNECT_HINT_SEC": 15,  # show troubleshooting help if no frame arrives by then
     "FRAME_WIDTH": 640,
     "FRAME_HEIGHT": 300,
     "JPEG_QUALITY": 70,
@@ -1074,18 +1077,19 @@ if WEBRTC_AVAILABLE:
                 self._overlay = {"yolo": yolo_result, "w": src_w, "h": src_h, "hud": hud}
 
         def recv(self, frame):
-            img = frame.to_ndarray(format="bgr24")
-            with self._lock:
-                self._latest_frame = img
-                overlay = self._overlay
+            try:
+                img = frame.to_ndarray(format="bgr24")
+                with self._lock:
+                    self._latest_frame = img
+                    overlay = self._overlay
 
-            out = img
-            if overlay is not None:
-                try:
-                    out = self._draw_overlay(img, overlay)
-                except Exception:
-                    out = img
-            return av.VideoFrame.from_ndarray(out, format="bgr24")
+                if overlay is None:
+                    return frame
+                out = self._draw_overlay(img, overlay)
+                return av.VideoFrame.from_ndarray(out, format="bgr24")
+            except Exception:
+                # Never let a drawing/convert error kill the live stream.
+                return frame
 
         @staticmethod
         def _draw_overlay(img: np.ndarray, overlay: Dict[str, Any]) -> np.ndarray:
@@ -1333,6 +1337,15 @@ def render_browser_camera_widget() -> None:
 
     ice_servers = get_ice_servers()
 
+    # The factory records the processor in a per-session dict so the detection
+    # loop can always find it, even when it only holds an older `ctx` object.
+    holder = st.session_state.setdefault("_cam_holder", {})
+
+    def _processor_factory():
+        proc = BrowserCameraProcessor()
+        holder["proc"] = proc
+        return proc
+
     with st.container(key="webrtc_transport"):
         ctx = webrtc_streamer(
             key="cybervision-browser-camera",
@@ -1347,7 +1360,7 @@ def render_browser_camera_widget() -> None:
                 },
                 "audio": False,
             },
-            video_processor_factory=BrowserCameraProcessor,
+            video_processor_factory=_processor_factory,
             video_html_attrs={
                 "autoPlay": True,
                 "controls": False,
@@ -1477,20 +1490,23 @@ class VideoCaptureManager:
 
     @staticmethod
     def _capture_from_browser() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
-        ctx = st.session_state.get("webrtc_ctx")
-        if ctx is None or ctx.video_processor is None:
+        processor = (st.session_state.get("_cam_holder") or {}).get("proc")
+        if processor is None:
+            ctx = st.session_state.get("webrtc_ctx")
+            processor = getattr(ctx, "video_processor", None)
+        if processor is None:
             st.session_state.last_error = "Waiting for browser camera permission..."
             return {}, None
 
-        frame = ctx.video_processor.get_latest_frame()
+        frame = processor.get_latest_frame()
         if frame is None:
             st.session_state.last_error = "Waiting for first frame from browser camera..."
             return {}, None
 
-        # Keep the camera's real aspect ratio (the old fixed 640x300 resize
-        # squashed 4:3 webcams).
+        # Keep the camera's real aspect ratio, and analyse a small copy: the
+        # live video itself is shown by the browser, so full size isn't needed.
         h, w = frame.shape[:2]
-        target_w = CONFIG["FRAME_WIDTH"]
+        target_w = CONFIG["WEBRTC_ANALYSIS_WIDTH"]
         target_h = max(1, int(round(h * target_w / max(w, 1))))
         primary_frame = cv2.resize(frame, (target_w, target_h))
 
@@ -2252,9 +2268,10 @@ def run_detection_pipeline(frame: np.ndarray) -> Dict[str, Any]:
     yolo_detector.drain_worker_queue()
 
     frame_number = st.session_state.frames_processed
+    yolo_every = 2 if st.session_state.get("use_webrtc") else CONFIG["YOLO_EVERY_N_FRAMES"]
     run_yolo_now = (
         st.session_state.get("yolo_detection") is None
-        or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"]) == 0
+        or frame_number % max(1, yolo_every) == 0
     )
 
     if run_yolo_now:
@@ -2606,7 +2623,7 @@ def _render_live_stats_body() -> None:
 
 
 def render_live_stats_panel() -> None:
-    refresh = 0.1 if st.session_state.get("camera_running") else None
+    refresh = 1.0 if st.session_state.get("camera_running") else None
     st.fragment(_render_live_stats_body, run_every=refresh)()
 
 
@@ -2650,8 +2667,24 @@ def _show_frame(slot, image, **kwargs) -> None:
         slot.image(image, use_container_width=True, **kwargs)
 
 
-@st.fragment(run_every=0.1)
 def live_camera_fragment() -> None:
+    interval = CONFIG["WEBRTC_TICK_SEC"] if st.session_state.get("use_webrtc") else 0.1
+    st.fragment(_live_camera_body, run_every=interval)()
+
+
+def _connection_help_text() -> str:
+    tier = ICE_SERVER_DIAGNOSTICS.get("tier", "unknown")
+    detail = ICE_SERVER_DIAGNOSTICS.get("detail", "")
+    return (
+        "Still no video from your browser. Check: (1) the page is opened over HTTPS and "
+        "you clicked Allow on the camera prompt (lock icon in the address bar if it never "
+        "appeared); (2) no other app is using the camera; (3) relay status: "
+        f"{tier}{' - ' + detail if detail else ''}. A STUN-only setup cannot connect from "
+        "most hosted apps; add the TURN secrets and reboot."
+    )
+
+
+def _live_camera_body() -> None:
     # The frame/status slots are created INSIDE the fragment. A placeholder
     # created outside and passed in raises StreamlitInvalidLayoutContextError when
     # the fragment reruns on its own (run_every).
@@ -2696,7 +2729,11 @@ def live_camera_fragment() -> None:
                     )
             message = st.session_state.get("last_error") or "Camera unavailable."
             if use_webrtc:
-                status_slot.info(message)
+                waited = time.time() - st.session_state.get("camera_started_at", time.time())
+                if waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
+                    status_slot.warning(_connection_help_text(), icon=":material/warning:")
+                else:
+                    status_slot.info(message)
             else:
                 status_slot.error(message)
             return
@@ -2769,6 +2806,7 @@ def render_video_feed() -> None:
             st.session_state.last_vlm_candidate_frame = None
             st.session_state.latest_vlm_text = ""
             st.session_state.last_frame_time = time.time()
+            st.session_state.camera_started_at = time.time()
             st.session_state.last_frame_rgb = None
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
@@ -2786,6 +2824,7 @@ def render_video_feed() -> None:
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.alarm_active = False
             st.session_state.active_hazard_toast = None
+            st.session_state.get("_cam_holder", {}).clear()
             release_camera()
             st.rerun()
 
