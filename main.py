@@ -146,7 +146,9 @@ CONFIG: Dict[str, Any] = {
     "CAMERA_SOURCES": [0],  # Primary webcam only (same as backup.py); probing 9 devices causes phantom feeds/hangs
     "WEBRTC_ANALYSIS_WIDTH": 320,   # browser-camera frames are analysed at this width (cheap on small servers)
     "WEBRTC_TICK_SEC": 0.25,        # detection tick in browser-camera mode (video itself is not tied to this)
+    "WEBRTC_PREVIEW_WIDTH_PX": 220, # size of the small browser-camera preview (kept visible for the permission prompt)
     "CAMERA_CONNECT_HINT_SEC": 15,  # show troubleshooting help if no frame arrives by then
+    "BUSY_FLAG_TIMEOUT_SEC": 8.0,   # a stuck "busy" flag is ignored after this long
     "FRAME_WIDTH": 640,
     "FRAME_HEIGHT": 300,
     "JPEG_QUALITY": 70,
@@ -319,6 +321,7 @@ def init_session_state() -> None:
         "active_page": "Dashboard",
         "webrtc_ctx": None,
         "_frame_processing_busy": False,
+        "_frame_processing_busy_since": 0.0,
     }
 
     for key, value in defaults.items():
@@ -341,6 +344,7 @@ def inject_custom_css() -> None:
     muted = "#6b7280"
     accent = "#f97316"
     accent_dark = "#c2410c"
+    preview_px = CONFIG["WEBRTC_PREVIEW_WIDTH_PX"]
 
     st.markdown(
         f"""
@@ -856,12 +860,21 @@ def inject_custom_css() -> None:
             color: {accent_dark};
         }}
 
-        /* Browser-camera (WebRTC) connector: kept VISIBLE and compact. Hiding it
-           (0px height / opacity 0) stops browsers from showing the camera
-           permission prompt, which is why the feed never appeared. */
+        /* Browser-camera (WebRTC) connector: kept VISIBLE but small. The 3x3
+           grid below is the real display; this is only the transport + the
+           browser's camera-permission anchor. Hiding it completely (0px height /
+           opacity 0 / display:none) stops browsers showing the permission prompt. */
         .st-key-webrtc_transport {{
-            min-height: 3rem;
+            min-height: 2.5rem;
             overflow: visible !important;
+        }}
+
+        .st-key-webrtc_transport video {{
+            width: {preview_px}px !important;
+            max-width: 100% !important;
+            height: auto !important;
+            border-radius: 10px !important;
+            background: #000;
         }}
         </style>
         """,
@@ -1067,54 +1080,29 @@ class ResourceGovernor:
 # =============================================================================
 if WEBRTC_AVAILABLE:
     class BrowserCameraProcessor(VideoProcessorBase):
+        """Receives frames from the visitor's browser camera.
+
+        BLACK-SCREEN FIX: the previous version rebuilt every frame with
+        `av.VideoFrame.from_ndarray(...)` and returned it WITHOUT copying
+        `pts` / `time_base`. aiortc needs those timestamps to encode the outgoing
+        stream, so the browser <video> stayed black. Detection overlays are now
+        drawn server-side onto the 3x3 grid (st.image), so this processor only
+        stores the latest frame and returns the ORIGINAL frame object untouched.
+        """
+
         def __init__(self) -> None:
             self._lock = threading.Lock()
             self._latest_frame: Optional[np.ndarray] = None
-            self._overlay: Optional[Dict[str, Any]] = None
-
-        def set_overlay(self, yolo_result: Dict[str, Any], src_w: int, src_h: int, hud: Tuple[str, str]) -> None:
-            with self._lock:
-                self._overlay = {"yolo": yolo_result, "w": src_w, "h": src_h, "hud": hud}
 
         def recv(self, frame):
             try:
                 img = frame.to_ndarray(format="bgr24")
                 with self._lock:
                     self._latest_frame = img
-                    overlay = self._overlay
-
-                if overlay is None:
-                    return frame
-                out = self._draw_overlay(img, overlay)
-                return av.VideoFrame.from_ndarray(out, format="bgr24")
             except Exception:
-                # Never let a drawing/convert error kill the live stream.
-                return frame
-
-        @staticmethod
-        def _draw_overlay(img: np.ndarray, overlay: Dict[str, Any]) -> np.ndarray:
-            # Detections are computed on a resized copy (overlay["w"] x overlay["h"]);
-            # scale them back onto the full-size frame the browser receives.
-            out = img.copy()
-            h, w = out.shape[:2]
-            sx = w / max(overlay["w"], 1)
-            sy = h / max(overlay["h"], 1)
-
-            for det in (overlay["yolo"] or {}).get("detections", []):
-                x1, y1, x2, y2 = det["box"]
-                p1 = (int(x1 * sx), int(y1 * sy))
-                p2 = (int(x2 * sx), int(y2 * sy))
-                label = f"{det['class']} {det['confidence']:.0%}"
-                cv2.rectangle(out, p1, p2, (0, 0, 255), 2)
-                cv2.putText(out, label, (p1[0], max(p1[1] - 8, 12)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-
-            shade = out.copy()
-            cv2.rectangle(shade, (10, 10), (430, 82), (0, 0, 0), -1)
-            cv2.addWeighted(shade, 0.50, out, 0.50, 0, out)
-            cv2.putText(out, overlay["hud"][0], (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
-            cv2.putText(out, overlay["hud"][1], (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
-            return out
+                pass
+            # Return the original frame: pts / time_base / format stay intact.
+            return frame
 
         def get_latest_frame(self) -> Optional[np.ndarray]:
             with self._lock:
@@ -1318,13 +1306,13 @@ def _describe_ice_servers(ice_servers: list) -> str:
 def render_browser_camera_widget() -> None:
     """Mounts the WebRTC connector that streams the VISITOR's webcam to the server.
 
-    Fixes for "camera doesn't display when started":
-      * SENDRECV instead of SENDONLY. In SENDONLY mode streamlit-webrtc does not
-        run the video processor, so BrowserCameraProcessor.recv() was never called
-        and the app waited forever for a first frame.
-      * The widget is visible (it used to be collapsed to 0px with opacity 0, which
-        stops browsers from showing the camera permission prompt).
-      * Removed the unsupported `media_toggle_controls` argument.
+    Notes:
+      * SENDRECV so streamlit-webrtc actually runs the video processor.
+      * The widget is shown as a small preview (not hidden): hiding it stops
+        browsers from showing the camera permission prompt.
+      * The processor returns the original frame untouched (see
+        BrowserCameraProcessor) so the stream never goes black.
+      * The main display is the server-rendered 3x3 grid below this widget.
     """
     if not WEBRTC_AVAILABLE:
         st.error(
@@ -1366,7 +1354,11 @@ def render_browser_camera_widget() -> None:
                 "controls": False,
                 "muted": True,
                 "playsInline": True,
-                "style": {"width": "100%", "borderRadius": "12px"},
+                "style": {
+                    "width": f"{CONFIG['WEBRTC_PREVIEW_WIDTH_PX']}px",
+                    "maxWidth": "100%",
+                    "borderRadius": "10px",
+                },
             },
             async_processing=True,
         )
@@ -1374,7 +1366,8 @@ def render_browser_camera_widget() -> None:
     st.session_state.webrtc_ctx = ctx
 
     state = getattr(ctx, "state", None)
-    if state is not None and getattr(state, "playing", False):
+    playing = bool(state is not None and getattr(state, "playing", False))
+    if playing:
         st.caption(":material/videocam: Browser camera connected.")
     else:
         st.caption(
@@ -1382,7 +1375,7 @@ def render_browser_camera_widget() -> None:
             "If no prompt appears, press START above."
         )
     ice_note = _describe_ice_servers(ice_servers)
-    if ice_note.startswith(":material/info:") and not (state is not None and getattr(state, "playing", False)):
+    if ice_note.startswith(":material/info:") and not playing:
         st.warning(
             "No TURN relay is configured, so a hosted app usually cannot connect to your "
             "browser camera. Add CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_KEY_API_TOKEN "
@@ -1393,7 +1386,7 @@ def render_browser_camera_widget() -> None:
 
 
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX (LOCAL DEVICES ONLY)
+# MULTI-CAMERA HANDLING & 3x3 MATRIX
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
@@ -1503,8 +1496,7 @@ class VideoCaptureManager:
             st.session_state.last_error = "Waiting for first frame from browser camera..."
             return {}, None
 
-        # Keep the camera's real aspect ratio, and analyse a small copy: the
-        # live video itself is shown by the browser, so full size isn't needed.
+        # Keep the camera's real aspect ratio, and analyse a small copy.
         h, w = frame.shape[:2]
         target_w = CONFIG["WEBRTC_ANALYSIS_WIDTH"]
         target_h = max(1, int(round(h * target_w / max(w, 1))))
@@ -2579,7 +2571,6 @@ def render_dashboard_header() -> None:
     else:
         pill_text, pill_color = "STANDBY", "#6b7280"
 
-    # (The old markup had two stray closing </div> tags that broke the layout.)
     st.markdown(
         f"""
         <div class="dash-header">
@@ -2633,7 +2624,12 @@ def render_video_status_bar() -> None:
         sum(st.session_state.latency_history) / len(st.session_state.latency_history)
         if st.session_state.latency_history else 0.0
     )
-    resolution = f"{CONFIG['FRAME_WIDTH']}x{CONFIG['FRAME_HEIGHT']}"
+
+    last_rgb = st.session_state.get("last_frame_rgb")
+    if last_rgb is not None:
+        resolution = f"{last_rgb.shape[1]}x{last_rgb.shape[0]}"
+    else:
+        resolution = f"{CONFIG['FRAME_WIDTH']}x{CONFIG['FRAME_HEIGHT']}"
 
     st.markdown(
         f"""
@@ -2684,6 +2680,15 @@ def _connection_help_text() -> str:
     )
 
 
+def _busy_flag_active() -> bool:
+    """True if another tick is genuinely still processing. A flag older than
+    BUSY_FLAG_TIMEOUT_SEC is treated as stale (e.g. a run that was interrupted)."""
+    if not st.session_state.get("_frame_processing_busy"):
+        return False
+    since = st.session_state.get("_frame_processing_busy_since", 0.0)
+    return (time.time() - since) < CONFIG["BUSY_FLAG_TIMEOUT_SEC"]
+
+
 def _live_camera_body() -> None:
     # The frame/status slots are created INSIDE the fragment. A placeholder
     # created outside and passed in raises StreamlitInvalidLayoutContextError when
@@ -2701,32 +2706,34 @@ def _live_camera_body() -> None:
     if not st.session_state.get("camera_running", False):
         return
 
-    if st.session_state.get("_frame_processing_busy"):
-        if not st.session_state.get("use_webrtc"):
-            _redraw_last_frame()
+    # A fragment rerun that draws nothing makes the previous image disappear, so
+    # when we skip a tick we must redraw the last grid (in BOTH camera modes).
+    if _busy_flag_active():
+        _redraw_last_frame()
         return
 
     st.session_state._frame_processing_busy = True
+    st.session_state._frame_processing_busy_since = time.time()
     try:
         use_webrtc = bool(st.session_state.get("use_webrtc"))
         active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
 
         if primary_frame is None and not active_frames:
-            # WEB FIX: while the browser camera is still connecting, show a clear
-            # "starting" tile (not a blank area) and an info message (not an error).
-            if not use_webrtc:
-                if st.session_state.get("last_frame_rgb") is not None:
-                    _redraw_last_frame()
-                else:
-                    _show_frame(
-                        frame_slot,
-                        VideoCaptureManager.placeholder_frame(
-                            "Starting camera...",
-                            "Allow camera access in your browser.",
-                        ),
-                        channels="RGB",
-                        output_format="JPEG",
-                    )
+            # While the camera is still connecting, show a clear "starting" tile
+            # (not a blank area) and an info message (not an error).
+            if st.session_state.get("last_frame_rgb") is not None:
+                _redraw_last_frame()
+            else:
+                _show_frame(
+                    frame_slot,
+                    VideoCaptureManager.placeholder_frame(
+                        "Starting camera...",
+                        "Allow camera access in your browser." if use_webrtc else "Opening local camera.",
+                    ),
+                    channels="RGB",
+                    output_format="JPEG",
+                )
+
             message = st.session_state.get("last_error") or "Camera unavailable."
             if use_webrtc:
                 waited = time.time() - st.session_state.get("camera_started_at", time.time())
@@ -2752,12 +2759,9 @@ def _live_camera_body() -> None:
         if 0 in active_frames and primary_frame is not None:
             active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(primary_frame, yolo_result)
 
-        if use_webrtc:
-            # A visitor has exactly one webcam: show it full-width instead of one
-            # live tile surrounded by eight "NO CAMERA" tiles.
-            display = active_frames[0].copy()
-        else:
-            display = construct_3x3_grid(active_frames)
+        # 3x3 grid in BOTH modes: the live camera is CAM_01, the other eight
+        # tiles show "NO CAMERA DETECTED" (same as the local-device layout).
+        display = construct_3x3_grid(active_frames)
 
         severity = st.session_state.get("yolo_severity", "NORMAL")
         yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
@@ -2775,23 +2779,9 @@ def _live_camera_body() -> None:
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = display_rgb
 
-        if use_webrtc:
-            # The visitor's own <video> element is the live display. Hand the
-            # latest detections to the processor so boxes + HUD are drawn onto
-            # the stream itself (no per-frame image upload to the browser).
-            ctx = st.session_state.get("webrtc_ctx")
-            processor = getattr(ctx, "video_processor", None)
-            if processor is not None:
-                processor.set_overlay(
-                    yolo_result,
-                    int(primary_frame.shape[1]),
-                    int(primary_frame.shape[0]),
-                    (hud_line_1, hud_line_2),
-                )
-            status_slot.empty()
-        else:
-            # JPEG encodes far faster and more consistently than the default PNG.
-            _show_frame(frame_slot, display_rgb, channels="RGB", output_format="JPEG")
+        # JPEG encodes far faster and more consistently than the default PNG.
+        _show_frame(frame_slot, display_rgb, channels="RGB", output_format="JPEG")
+        status_slot.empty()
     finally:
         st.session_state._frame_processing_busy = False
 
@@ -2810,8 +2800,12 @@ def render_video_feed() -> None:
             st.session_state.last_frame_rgb = None
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
+            st.session_state.yolo_detection = None
+            st.session_state.yolo_detection_in_progress = False
             st.session_state.alarm_active = False
             st.session_state.active_hazard_toast = None
+            st.session_state._frame_processing_busy = False
+            st.session_state._frame_processing_busy_since = 0.0
 
             if st.session_state.get("yolo_detector") is None:
                 st.session_state.yolo_detector = YOLOFireSmokeDetector()
@@ -2824,6 +2818,8 @@ def render_video_feed() -> None:
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.alarm_active = False
             st.session_state.active_hazard_toast = None
+            st.session_state._frame_processing_busy = False
+            st.session_state._frame_processing_busy_since = 0.0
             st.session_state.get("_cam_holder", {}).clear()
             release_camera()
             st.rerun()
@@ -2848,7 +2844,8 @@ def render_video_feed() -> None:
         return
 
     # The WebRTC connector is only mounted while the camera is running, so
-    # pressing Stop also releases the visitor's webcam.
+    # pressing Stop also releases the visitor's webcam. It is shown as a small
+    # preview; the main display is the 3x3 grid drawn by the fragment below.
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget()
 
