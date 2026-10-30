@@ -169,9 +169,9 @@ CONFIG: Dict[str, Any] = {
     "CAMERA_INDEX": 0,
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
     "WEBRTC_ANALYSIS_WIDTH": 320,       # browser-camera frames are analysed at this width
-    "WEBRTC_TICK_SEC": 0.5,             # alert/stat tick in browser-camera mode (draws no images)
+    "WEBRTC_TICK_SEC": 0.75,            # alert/stat tick in browser-camera mode (draws no images)
     "WEBRTC_YOLO_MIN_INTERVAL_SEC": 0.8,  # adaptive governor raises this during pressure  # min gap between YOLO runs inside the video processor
-    "WEBRTC_YOLO_RESULT_TTL_SEC": 4.0,  # avoid dropping slow CPU inference immediately  # boxes older than this are dropped
+    "WEBRTC_YOLO_RESULT_TTL_SEC": 3.0,  # boxes older than this are dropped
     "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,    # a frame older than this counts as "no signal"
     "SNAPSHOT_ANALYSIS_WIDTH": 640,
     "CAMERA_CONNECT_HINT_SEC": 15,
@@ -201,9 +201,9 @@ CONFIG: Dict[str, Any] = {
     "YOLO_CONFIDENCE": 0.22,  # model proposal threshold, then apply per-class thresholds
     "YOLO_FIRE_CONFIDENCE": 0.35,
     "YOLO_SMOKE_CONFIDENCE": 0.25,
-    "YOLO_IMAGE_SIZE": 512,  # 160 px removed too much detail for diffuse smoke
-    "YOLO_EVERY_N_FRAMES": 6,
-    "VISUAL_DETECT_EVERY_N_FRAMES": 3,
+    "YOLO_IMAGE_SIZE": 416,  # 160 px removed too much detail for diffuse smoke
+    "YOLO_EVERY_N_FRAMES": 8,
+    "VISUAL_DETECT_EVERY_N_FRAMES": 4,
 }
 
 SEVERITY_STYLE = {
@@ -391,6 +391,7 @@ def init_session_state() -> None:
         "resource_throttle_level": 0,
         "active_hazard_toast": None,
         "active_page": "Dashboard",
+        "browser_cam_mode": BROWSER_MODE_LIVE,
         "webrtc_ctx": None,
         "_frame_processing_busy": False,
         "_frame_processing_busy_since": 0.0,
@@ -691,16 +692,48 @@ def inject_custom_css() -> None:
             margin: 1.2rem 0 0.9rem 0;
         }}
 
+        .st-key-cpu_metric_normal [data-testid="stMetricDelta"],
+        .st-key-cpu_metric_normal [data-testid="stMetricDelta"] span,
+        .st-key-cpu_metric_normal [data-testid="stMetricDelta"] svg,
+        .st-key-ram_metric_normal [data-testid="stMetricDelta"],
+        .st-key-ram_metric_normal [data-testid="stMetricDelta"] span,
+        .st-key-ram_metric_normal [data-testid="stMetricDelta"] svg {{
+            color: #16a34a !important;
+            fill: #16a34a !important;
+        }}
+
+        .st-key-cpu_metric_medium [data-testid="stMetricDelta"],
+        .st-key-cpu_metric_medium [data-testid="stMetricDelta"] span,
+        .st-key-cpu_metric_medium [data-testid="stMetricDelta"] svg,
+        .st-key-ram_metric_medium [data-testid="stMetricDelta"],
+        .st-key-ram_metric_medium [data-testid="stMetricDelta"] span,
+        .st-key-ram_metric_medium [data-testid="stMetricDelta"] svg {{
+            color: #eab308 !important;
+            fill: #eab308 !important;
+        }}
+
         .st-key-cpu_metric_high [data-testid="stMetricValue"],
         .st-key-ram_metric_high [data-testid="stMetricValue"],
         .st-key-cpu_metric_high [data-testid="stMetricDelta"],
-        .st-key-ram_metric_high [data-testid="stMetricDelta"] {{
-            color: #ff3b30 !important;
+        .st-key-cpu_metric_high [data-testid="stMetricDelta"] span,
+        .st-key-cpu_metric_high [data-testid="stMetricDelta"] svg,
+        .st-key-ram_metric_high [data-testid="stMetricDelta"],
+        .st-key-ram_metric_high [data-testid="stMetricDelta"] span,
+        .st-key-ram_metric_high [data-testid="stMetricDelta"] svg {{
+            color: #f59e0b !important;
+            fill: #f59e0b !important;
         }}
 
-        .st-key-cpu_metric_high [data-testid="stMetricDelta"] svg,
-        .st-key-ram_metric_high [data-testid="stMetricDelta"] svg {{
-            fill: #ff3b30 !important;
+        .st-key-cpu_metric_critical [data-testid="stMetricValue"],
+        .st-key-ram_metric_critical [data-testid="stMetricValue"],
+        .st-key-cpu_metric_critical [data-testid="stMetricDelta"],
+        .st-key-cpu_metric_critical [data-testid="stMetricDelta"] span,
+        .st-key-cpu_metric_critical [data-testid="stMetricDelta"] svg,
+        .st-key-ram_metric_critical [data-testid="stMetricDelta"],
+        .st-key-ram_metric_critical [data-testid="stMetricDelta"] span,
+        .st-key-ram_metric_critical [data-testid="stMetricDelta"] svg {{
+            color: #dc2626 !important;
+            fill: #dc2626 !important;
         }}
 
         .st-key-severity_metric_normal [data-testid="stMetricValue"],
@@ -1072,11 +1105,11 @@ class ResourceGovernor:
 
     @staticmethod
     def yolo_interval() -> float:
-        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 1.8, 3.5)[ResourceGovernor.level()]
+        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 1.4, 2.2)[ResourceGovernor.level()]
 
     @staticmethod
     def pipeline_interval() -> float:
-        return (0.5, 1.0, 2.0)[ResourceGovernor.level()]
+        return (0.75, 1.25, 2.0)[ResourceGovernor.level()]
 
     @staticmethod
     def yolo_image_size() -> int:
@@ -1458,9 +1491,9 @@ def render_browser_camera_widget() -> None:
             rtc_configuration={"iceServers": ice_servers},
             media_stream_constraints={
                 "video": {
-                    "width": {"ideal": 640},
-                    "height": {"ideal": 480},
-                    "frameRate": {"ideal": 15},
+                    "width": {"ideal": 480, "max": 640},
+                    "height": {"ideal": 360, "max": 480},
+                    "frameRate": {"ideal": 12, "max": 15},
                 },
                 "audio": False,
             },
@@ -2596,32 +2629,36 @@ def render_sidebar_nav() -> None:
             render_sidebar_profile()
 
 
+def _metric_status_class(value: float) -> str:
+    if value >= 90:
+        return "critical"
+    if value >= 70:
+        return "medium"
+    return "normal"
+
+
+def _metric_delta_icon(value: float) -> str:
+    if value >= 90:
+        return ":material/error:"
+    if value >= 70:
+        return ":material/warning:"
+    return ":material/check_circle:"
+
+
 def render_dashboard_settings_panel() -> None:
     with st.container():
         st.markdown("<div class='stats-panel-title'>Server Setup</div>", unsafe_allow_html=True)
 
-        if st.session_state.get("use_webrtc"):
-            st.radio(
-                "Browser camera mode",
-                [BROWSER_MODE_LIVE, BROWSER_MODE_SNAPSHOT],
-                key="browser_cam_mode",
-                horizontal=True,
-                help=(
-                    "Live stream needs a working WebRTC connection. Snapshot takes a photo "
-                    "with your browser camera and analyses it; it works even when WebRTC cannot connect."
-                ),
-            )
+        # Hidden controls intentionally removed from the UI per design request:
+        # - Browser camera mode
+        # - Cloud/local backup toggle
+        # - Inference throttle caption
+        # Keep the underlying behavior enabled with sensible defaults.
+        st.session_state.browser_cam_mode = BROWSER_MODE_LIVE
 
         st.session_state.sound_enabled = st.toggle(
             "Alert sound",
             value=st.session_state.sound_enabled,
-        )
-
-        sync_label = ("Cloud backup enabled" if st.session_state.cloud_sync_enabled
-                      else "Local backup only")
-        st.session_state.cloud_sync_enabled = st.toggle(
-            sync_label,
-            value=st.session_state.cloud_sync_enabled,
         )
 
         if st.session_state.cloud_sync_enabled:
@@ -2638,8 +2675,6 @@ def render_dashboard_settings_panel() -> None:
                     st.warning(f"Cloud sync error: {cloud_status['last_error']}")
                 elif cloud_status["last_success"]:
                     st.caption(f":material/check_circle: {cloud_status['last_success']}")
-                else:
-                    st.caption("Credentials found. Waiting for a hazard event or cloud test.")
                 if st.button("Test Google Cloud", key="test_gcp_button"):
                     client, db = get_gcp_clients()
                     try:
@@ -2651,7 +2686,6 @@ def render_dashboard_settings_panel() -> None:
                         blob.upload_from_string('{"test":true}', content_type="application/json")
                         doc = db.collection("cybervision_diagnostics").document(marker_id)
                         doc.set({"test": True, "timestamp": firestore.SERVER_TIMESTAMP})
-                        # Object-creator role need not have delete or bucket-metadata access.
                         try:
                             blob.delete()
                             doc.delete()
@@ -2660,10 +2694,6 @@ def render_dashboard_settings_panel() -> None:
                         st.success("Storage and Firestore write permissions confirmed.")
                     except Exception as exc:
                         st.error(f"Cloud test failed: {type(exc).__name__}: {exc}")
-
-        level = st.session_state.get("resource_throttle_level", 0)
-        st.caption(f"Inference throttle: level {level} — " +
-                   ("normal" if level == 0 else "reduced frequency" if level == 1 else "heavy reduction"))
 
         timeout_option = st.selectbox(
             "Inference timeout target",
@@ -2677,17 +2707,17 @@ def render_dashboard_settings_panel() -> None:
         st.markdown("<div class='stats-panel-title'>Resources</div>", unsafe_allow_html=True)
 
         metrics = SystemMonitor.get_metrics()
-        cpu_high = metrics["cpu"] >= CONFIG["CPU_THRESHOLD"]
-        ram_high = metrics["ram"] >= CONFIG["RAM_THRESHOLD"]
-        cpu_delta = ":material/check_circle:" if metrics["cpu"] < 70 else ":material/warning:" if not cpu_high else ":material/error:"
-        ram_delta = ":material/check_circle:" if metrics["ram"] < 70 else ":material/warning:" if not ram_high else ":material/error:"
+        cpu_class = _metric_status_class(metrics["cpu"])
+        ram_class = _metric_status_class(metrics["ram"])
+        cpu_delta = _metric_delta_icon(metrics["cpu"])
+        ram_delta = _metric_delta_icon(metrics["ram"])
 
         m1, m2 = st.columns(2)
         with m1:
-            with st.container(key="cpu_metric_high" if cpu_high else "cpu_metric_normal"):
+            with st.container(key=f"cpu_metric_{cpu_class}"):
                 st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
         with m2:
-            with st.container(key="ram_metric_high" if ram_high else "ram_metric_normal"):
+            with st.container(key=f"ram_metric_{ram_class}"):
                 st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
 
         if st.session_state.latency_history:
@@ -2703,70 +2733,6 @@ def render_dashboard_settings_panel() -> None:
             with st.expander(":material/error: YOLO not active — details", expanded=True):
                 for label, value in get_yolo_debug_info().items():
                     st.text(f"{label}: {value}")
-
-
-# =============================================================================
-# DASHBOARD COMPONENTS
-# =============================================================================
-def _browser_snapshot_mode() -> bool:
-    return bool(
-        st.session_state.get("use_webrtc")
-        and st.session_state.get("browser_cam_mode") == BROWSER_MODE_SNAPSHOT
-    )
-
-
-def render_dashboard_header() -> None:
-    cam_running = st.session_state.camera_running or _browser_snapshot_mode()
-    yolo_ready = is_yolo_model_available()
-
-    if cam_running and yolo_ready:
-        pill_text, pill_color = "YOLO ACTIVE", "#16a34a"
-    elif cam_running:
-        pill_text, pill_color = "FALLBACK MODE", "#ca8a04"
-    else:
-        pill_text, pill_color = "STANDBY", "#6b7280"
-
-    st.markdown(
-        f"""
-        <div class="dash-header">
-            <div>
-                <div class="dash-header-title">Live Camera Feeds</div>
-                <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
-            </div>
-            <div class="status-pill-live" style="background:{pill_color}1f; color:{pill_color};">
-                <span class="status-pill-dot" style="background:{pill_color};"></span>
-                {pill_text}
-            </div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _render_live_stats_body() -> None:
-    latest = st.session_state.get("latest_detection") or {}
-
-    severity = str(st.session_state.get("yolo_severity", "NORMAL")).upper()
-    if severity not in SEVERITY_STYLE:
-        severity = "NORMAL"
-
-    total = len(st.session_state.alert_history)
-    hazards = sum(1 for item in st.session_state.alert_history if item["is_hazard"])
-    confidence = (latest.get("confidence", 0) * 100 if latest else 0)
-
-    with st.container():
-        st.markdown("<div class='stats-panel-title'>Active Monitoring</div>", unsafe_allow_html=True)
-
-        r1c1, r1c2 = st.columns(2)
-        with r1c1:
-            with st.container(key=f"severity_metric_{severity.lower()}"):
-                st.metric("Severity", severity)
-        r1c2.metric("Confidence", f"{confidence:.0f}%")
-
-        r2c1, r2c2 = st.columns(2)
-        r2c1.metric("Frames", st.session_state.frames_processed)
-        r2c2.metric("Hazards", hazards, f"of {total}")
-
 
 def render_live_stats_panel() -> None:
     refresh = 1.0 if st.session_state.get("camera_running") else None
@@ -2858,7 +2824,7 @@ def _connection_help_text() -> str:
         "Check: (1) the page is opened over HTTPS and you clicked Allow on the camera prompt "
         "(lock icon in the address bar if it never appeared); (2) no other app is using the camera. "
         f"Relay: {tier}{' - ' + detail if detail else ''}. "
-        "If it still will not connect, set 'Browser camera mode' to Snapshot - that works without WebRTC."
+        "If it still will not connect, reload the page and allow camera access again."
     )
 
 
