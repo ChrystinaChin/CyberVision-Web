@@ -8,6 +8,8 @@ import re
 import socket
 import sqlite3
 import tempfile
+import uuid
+import logging
 import threading
 import time
 import wave
@@ -21,6 +23,33 @@ import numpy as np
 import pandas as pd
 import psutil
 import streamlit as st
+
+LOG = logging.getLogger("cybervision")
+CLOUD_STATUS_LOCK = threading.Lock()
+CLOUD_STATUS = {"last_success": "", "last_error": "", "last_attempt": "",
+                "storage_success": "", "storage_error": "",
+                "firestore_success": "", "firestore_error": ""}
+CLOUD_SYNC_LOCK = threading.Lock()
+YOLO_INFERENCE_LOCK = threading.Lock()
+RESOURCE_LOAD_LOCK = threading.Lock()
+RESOURCE_LOAD = {"level": 0}
+
+def _update_cloud_status(success: bool, detail: str = "", service: str = "") -> None:
+    # Workers must never access st.session_state or st.secrets.
+    with CLOUD_STATUS_LOCK:
+        key = "last_success" if success else "last_error"
+        CLOUD_STATUS[key] = datetime.now().strftime("%Y-%m-%d %H:%M:%S") + (f" — {detail}" if detail else "")
+        CLOUD_STATUS["last_attempt"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        if service in ("storage", "firestore"):
+            CLOUD_STATUS[service + ("_success" if success else "_error")] = CLOUD_STATUS[key]
+            if success:
+                CLOUD_STATUS[service + "_error"] = ""
+        # Do not erase an outstanding Firestore failure when Storage succeeds.
+        if success and not CLOUD_STATUS["storage_error"] and not CLOUD_STATUS["firestore_error"]:
+            CLOUD_STATUS["last_error"] = ""
+    if not success:
+        LOG.warning("Cloud sync: %s", detail)
+
 
 # Must be the absolute first Streamlit command executed
 st.set_page_config(
@@ -141,8 +170,8 @@ CONFIG: Dict[str, Any] = {
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
     "WEBRTC_ANALYSIS_WIDTH": 320,       # browser-camera frames are analysed at this width
     "WEBRTC_TICK_SEC": 0.5,             # alert/stat tick in browser-camera mode (draws no images)
-    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 0.3,  # min gap between YOLO runs inside the video processor
-    "WEBRTC_YOLO_RESULT_TTL_SEC": 1.5,  # boxes older than this are dropped
+    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 0.8,  # adaptive governor raises this during pressure  # min gap between YOLO runs inside the video processor
+    "WEBRTC_YOLO_RESULT_TTL_SEC": 4.0,  # avoid dropping slow CPU inference immediately  # boxes older than this are dropped
     "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,    # a frame older than this counts as "no signal"
     "SNAPSHOT_ANALYSIS_WIDTH": 640,
     "CAMERA_CONNECT_HINT_SEC": 15,
@@ -158,7 +187,7 @@ CONFIG: Dict[str, Any] = {
     "METRICS_HISTORY_MAX": 150,
     "LATENCY_HISTORY_MAX": 100,
     "TOAST_DISPLAY_SECONDS": 6.0,
-    "CLOUD_UPLOAD_MIN_INTERVAL_SEC": 3.0,
+    "CLOUD_UPLOAD_MIN_INTERVAL_SEC": 10.0,  # bounded cloud writes per hazard episode
     "YARA_RULE_PATH": "hazard_rules.yar",
     # GCP Credentials & Bucket Configuration
     "GCP_BUCKET": "cybervision_history",
@@ -169,8 +198,10 @@ CONFIG: Dict[str, Any] = {
         os.path.dirname(os.path.abspath(__file__)),
         "YOLO_dataset.pt",
     ),
-    "YOLO_CONFIDENCE": 0.45,
-    "YOLO_IMAGE_SIZE": 160,
+    "YOLO_CONFIDENCE": 0.22,  # model proposal threshold, then apply per-class thresholds
+    "YOLO_FIRE_CONFIDENCE": 0.35,
+    "YOLO_SMOKE_CONFIDENCE": 0.25,
+    "YOLO_IMAGE_SIZE": 512,  # 160 px removed too much detail for diffuse smoke
     "YOLO_EVERY_N_FRAMES": 6,
     "VISUAL_DETECT_EVERY_N_FRAMES": 3,
 }
@@ -200,82 +231,102 @@ EMPTY_YOLO_RESULT: Dict[str, Any] = {
 # OFFLINE SQLITE BUFFER & GCP FIRESTORE SYNC THREAD
 # =============================================================================
 def init_db() -> None:
-    with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            CREATE TABLE IF NOT EXISTS pending_events (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp REAL,
-                severity TEXT,
-                description TEXT,
-                camera_id TEXT,
-                synced INTEGER DEFAULT 0
-            )
-        """)
-        conn.commit()
+    with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS pending_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            timestamp REAL, severity TEXT, description TEXT, camera_id TEXT,
+            synced INTEGER DEFAULT 0, event_uuid TEXT
+        )""")
+        cols = {row[1] for row in conn.execute("PRAGMA table_info(pending_events)")}
+        if "event_uuid" not in cols:  # migrate localhost-created databases
+            conn.execute("ALTER TABLE pending_events ADD COLUMN event_uuid TEXT")
 
 
-def save_event_locally(timestamp: float, severity: str, description: str, camera_id: str = "CAM_01") -> None:
-    with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
-        cursor = conn.cursor()
-        cursor.execute("""
-            INSERT INTO pending_events (timestamp, severity, description, camera_id, synced)
-            VALUES (?, ?, ?, ?, 0)
-        """, (timestamp, severity, description, camera_id))
-        conn.commit()
+def save_event_locally(timestamp: float, severity: str, description: str,
+                       camera_id: str = "CAM_01", event_uuid: Optional[str] = None,
+                       cloud_enabled: bool = True) -> None:
+    with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+        conn.execute("""INSERT INTO pending_events
+            (timestamp, severity, description, camera_id, synced, event_uuid)
+            VALUES (?, ?, ?, ?, ?, ?)""",
+            (timestamp, severity, description, camera_id, 0 if cloud_enabled else 1,
+             event_uuid or uuid.uuid4().hex))
 
 
 _WIFI_CHECK_CACHE: Dict[str, Any] = {"checked_at": 0.0, "online": False}
 _WIFI_CHECK_TTL_SECONDS = 15.0
 
 
-def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: float = 1.0) -> bool:
-    # Cached: called on every rerun (sidebar, settings panel, sync thread).
+def is_wifi_connected(host: str = "storage.googleapis.com", port: int = 443,
+                      timeout: float = 1.5) -> bool:
+    """Advisory reachability only. NEVER gate cloud writes on a probe."""
     now = time.time()
     if now - _WIFI_CHECK_CACHE["checked_at"] < _WIFI_CHECK_TTL_SECONDS:
         return bool(_WIFI_CHECK_CACHE["online"])
-
     try:
         with socket.create_connection((host, port), timeout=timeout):
             online = True
     except OSError:
         online = False
-
-    _WIFI_CHECK_CACHE["checked_at"] = now
-    _WIFI_CHECK_CACHE["online"] = online
+    _WIFI_CHECK_CACHE.update(checked_at=now, online=online)
     return online
+
+
+def sync_cloud_once() -> None:
+    """Serialize retries. A failed GCS or Firestore write remains pending."""
+    if not CLOUD_SYNC_LOCK.acquire(blocking=False):
+        return
+    try:
+        pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
+        has_images = os.path.isdir(pending_dir) and any(
+            f.endswith(".jpg") for f in os.listdir(pending_dir))
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+            has_events = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM pending_events WHERE synced=0)"
+            ).fetchone()[0]
+        if not has_images and not has_events:
+            return
+        if not GCP_AVAILABLE:
+            _update_cloud_status(False, "Google Cloud SDK not installed.")
+            return
+        gcs_client, db_client = get_gcp_clients()
+        if gcs_client is None or db_client is None:
+            _update_cloud_status(False, "GCP client initialization failed; check service account and project.")
+            return
+        # Event database is separate from GCS image backups: retry either independently.
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+            rows = conn.execute("""SELECT id, timestamp, severity, description,
+                camera_id, event_uuid FROM pending_events WHERE synced = 0 ORDER BY id LIMIT 30""").fetchall()
+            for event_id, ts, sev, desc, cam_id, event_uuid in rows:
+                event_uuid = event_uuid or uuid.uuid4().hex
+                conn.execute("UPDATE pending_events SET event_uuid = ? WHERE id = ?",
+                             (event_uuid, event_id))
+                try:
+                    db_client.collection("hazard_events").document(event_uuid).set({
+                        "event_id": event_uuid, "timestamp": ts, "severity": sev,
+                        "description": desc, "camera_id": cam_id,
+                        "synced_at": firestore.SERVER_TIMESTAMP,
+                    })
+                    conn.execute("UPDATE pending_events SET synced = 1 WHERE id = ?", (event_id,))
+                    conn.commit()
+                    _update_cloud_status(True, "Firestore event uploaded", service="firestore")
+                except Exception as exc:
+                    _update_cloud_status(False, f"Firestore: {type(exc).__name__}: {exc}", service="firestore")
+                    break
+        flush_pending_cloud_uploads(gcs_client)
+    except Exception as exc:
+        _update_cloud_status(False, f"Cloud sync: {type(exc).__name__}: {exc}")
+    finally:
+        CLOUD_SYNC_LOCK.release()
 
 
 def sync_worker_loop() -> None:
     while True:
-        if is_wifi_connected() and GCP_AVAILABLE and firestore is not None:
-            try:
-                _, db_client = get_gcp_clients()
-                if db_client is None:
-                    raise RuntimeError("GCP credentials not configured")
-                with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
-                    cursor = conn.cursor()
-                    cursor.execute("SELECT id, timestamp, severity, description, camera_id FROM pending_events WHERE synced = 0")
-                    unsynced_rows = cursor.fetchall()
-
-                    for row in unsynced_rows:
-                        event_id, ts, sev, desc, cam_id = row
-                        doc_ref = db_client.collection("hazard_events").document(f"event_{event_id}")
-                        doc_ref.set({
-                            "timestamp": ts,
-                            "severity": sev,
-                            "description": desc,
-                            "camera_id": cam_id,
-                            "synced_at": firestore.SERVER_TIMESTAMP
-                        })
-                        cursor.execute("UPDATE pending_events SET synced = 1 WHERE id = ?", (event_id,))
-                    conn.commit()
-            except Exception:
-                pass
-
-            flush_pending_cloud_uploads()
+        try:
+            sync_cloud_once()
+        except Exception as exc:
+            LOG.exception("Unexpected cloud worker failure: %s", exc)
         time.sleep(10)
-
 
 @st.cache_resource(show_spinner=False)
 def _start_sync_thread_once() -> bool:
@@ -286,6 +337,10 @@ def _start_sync_thread_once() -> bool:
 
 
 def start_sync_thread() -> None:
+    # Resolve Streamlit secrets on the script thread before a worker is launched.
+    configure_cloud_from_secrets()
+    if GCP_AVAILABLE:
+        get_gcp_clients()
     _start_sync_thread_once()
 
 
@@ -312,7 +367,7 @@ def init_session_state() -> None:
         "vlm_context": "READY",
         "last_error": "",
         "last_public_notice": "",
-        "cloud_sync_enabled": False,
+        "cloud_sync_enabled": bool(GCP_AVAILABLE and _get_gcp_service_account_info()),
         "fps": 0.0,
         "last_frame_time": time.time(),
         "camera_started_at": 0.0,
@@ -328,6 +383,12 @@ def init_session_state() -> None:
         "vlm_in_progress": False,
         "last_triggered_alert_ts": 0.0,
         "last_cloud_upload_ts": 0.0,
+        "last_cloud_hazard_type": "",
+        "last_pipeline_ts": 0.0,
+        "visual_smoke_streak": 0,
+        "visual_fire_streak": 0,
+        "visual_prev_frame": None,
+        "resource_throttle_level": 0,
         "active_hazard_toast": None,
         "active_page": "Dashboard",
         "webrtc_ctx": None,
@@ -986,35 +1047,44 @@ class ResourceGovernor:
     @staticmethod
     def check_resource_pressure() -> None:
         metrics = SystemMonitor.get_metrics()
-        cpu = metrics["cpu"]
-        ram = metrics["ram"]
-
+        cpu, ram = metrics["cpu"], metrics["ram"]
         if cpu >= CONFIG["CPU_THRESHOLD"] or ram >= CONFIG["RAM_THRESHOLD"]:
-            st.session_state.system_status = "RESOURCE_PRESSURE"
-            st.session_state.vlm_context = "REDUCED"
-            st.session_state.last_public_notice = (
-                f"Resource pressure detected. CPU={cpu:.1f}%, RAM={ram:.1f}%. "
-                "Using reduced context."
-            )
+            level = 2
+        elif cpu >= 75 or ram >= 80:
+            level = 1
         else:
-            st.session_state.system_status = "HEALTHY"
-            st.session_state.vlm_context = "ACTIVE"
-            st.session_state.last_public_notice = ""
+            level = 0
+        st.session_state.resource_throttle_level = level
+        with RESOURCE_LOAD_LOCK:
+            RESOURCE_LOAD["level"] = level
+        st.session_state.system_status = "RESOURCE_PRESSURE" if level else "HEALTHY"
+        st.session_state.vlm_context = "REDUCED" if level else "ACTIVE"
+        st.session_state.last_public_notice = (
+            f"Adaptive throttling level {level}: CPU={cpu:.1f}%, RAM={ram:.1f}%. "
+            "YOLO and analysis frequency reduced to protect the video stream."
+            if level else ""
+        )
+
+    @staticmethod
+    def level() -> int:
+        with RESOURCE_LOAD_LOCK:
+            return int(RESOURCE_LOAD["level"])
+
+    @staticmethod
+    def yolo_interval() -> float:
+        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 1.8, 3.5)[ResourceGovernor.level()]
+
+    @staticmethod
+    def pipeline_interval() -> float:
+        return (0.5, 1.0, 2.0)[ResourceGovernor.level()]
+
+    @staticmethod
+    def yolo_image_size() -> int:
+        return (CONFIG["YOLO_IMAGE_SIZE"], 448, 384)[ResourceGovernor.level()]
 
     @staticmethod
     def recommended_token_budget() -> int:
-        metrics = SystemMonitor.get_metrics()
-        worst = max(metrics["cpu"], metrics["ram"])
-
-        if worst >= 85:
-            return 128
-        if worst >= 70:
-            return 256
-        if worst >= 50:
-            return 512
-
-        return 1024
-
+        return (1024, 256, 128)[ResourceGovernor.level()]
 
 # =============================================================================
 # BROWSER CAMERA (WEBRTC)
@@ -1048,8 +1118,8 @@ if WEBRTC_AVAILABLE:
             result = None
             try:
                 result = self._detector.detect(img)
-            except Exception:
-                pass
+            except Exception as exc:
+                result = {**EMPTY_YOLO_RESULT, "error": str(exc)}
             with self._lock:
                 if result is not None:
                     self._yolo_result = result
@@ -1078,7 +1148,7 @@ if WEBRTC_AVAILABLE:
                     self._detector is not None
                     and self._detector.available
                     and not self._yolo_busy
-                    and now - self._last_yolo_start >= CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"]
+                    and now - self._last_yolo_start >= ResourceGovernor.yolo_interval()
                 ):
                     self._yolo_busy = True
                     self._last_yolo_start = now
@@ -1093,7 +1163,8 @@ if WEBRTC_AVAILABLE:
                 out = img.copy()
                 if yolo and yolo.get("detections"):
                     out = YOLOFireSmokeDetector.draw_boxes_on_frame(out, yolo)
-                status = "DETECTED" if (yolo and yolo.get("detected")) else "CLEAR"
+                status = ("NO MODEL" if self._detector is None or not self._detector.available
+                          else "DETECTED" if (yolo and yolo.get("detected")) else "CLEAR")
                 cv2.putText(
                     out,
                     f"CAM_01 [LIVE]  FPS {self._fps:.0f} | YOLO {status}",
@@ -1157,53 +1228,74 @@ def _get_metered_credentials() -> Tuple[Optional[str], Optional[str]]:
 # GOOGLE CLOUD CREDENTIALS
 # =============================================================================
 def _get_gcp_service_account_info() -> Optional[dict]:
-    raw = os.environ.get("GCP_SERVICE_ACCOUNT_JSON")
+    raw = _get_secret("GCP_SERVICE_ACCOUNT_JSON")
     if raw:
         try:
-            return json.loads(raw)
-        except Exception:
+            info = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if isinstance(info, dict):
+                return _normalize_service_account(info)
+        except (ValueError, TypeError):
             pass
-
     try:
-        if "gcp_service_account" in st.secrets:
-            return dict(st.secrets["gcp_service_account"])
-    except Exception:
-        pass
+        for key in ("gcp_service_account", "GCP_SERVICE_ACCOUNT", "service_account"):
+            if key in st.secrets:
+                info = st.secrets[key]
+                if isinstance(info, str):
+                    info = json.loads(info)
+                return _normalize_service_account(dict(info))
+        # Flat TOML service account fields are also supported.
+        if "private_key" in st.secrets and "client_email" in st.secrets:
+            return _normalize_service_account(dict(st.secrets))
+    except Exception as exc:
+        LOG.warning("Cannot parse GCP secret structure: %s", type(exc).__name__)
 
-    local_key_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "service_account.json"
-    )
+    local_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "service_account.json")
     if os.path.isfile(local_key_path):
         try:
-            with open(local_key_path, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-
+            with open(local_key_path, encoding="utf-8") as keyfile:
+                return _normalize_service_account(json.load(keyfile))
+        except Exception as exc:
+            LOG.warning("Could not load service_account.json: %s", type(exc).__name__)
     return None
+
+
+def _normalize_service_account(info: dict) -> dict:
+    result = dict(info)
+    key = result.get("private_key")
+    if isinstance(key, str):
+        result["private_key"] = key.replace("\\n", "\n")
+    return result
 
 
 @st.cache_resource(show_spinner=False)
 def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
     if not GCP_AVAILABLE:
         return None, None
-
-    info = _get_gcp_service_account_info()
-    project_id = CONFIG["GCP_PROJECT_ID"]
-
     try:
-        if info and gcp_service_account is not None:
-            credentials = gcp_service_account.Credentials.from_service_account_info(info)
-            project_id = info.get("project_id", project_id)
-            storage_client = storage.Client(credentials=credentials, project=project_id)
-            db_client = firestore.Client(credentials=credentials, project=project_id)
-        else:
-            storage_client = storage.Client(project=project_id)
-            db_client = firestore.Client(project=project_id)
-        return storage_client, db_client
-    except Exception:
+        info = _get_gcp_service_account_info()
+        if not info:
+            _update_cloud_status(False, "No service account found in Streamlit secrets.")
+            return None, None
+        credentials = gcp_service_account.Credentials.from_service_account_info(info)
+        # Honor deployment secrets rather than a hardcoded localhost project.
+        project = info.get("project_id") or _get_secret("GCP_PROJECT_ID") or CONFIG["GCP_PROJECT_ID"]
+        return (storage.Client(credentials=credentials, project=project),
+                firestore.Client(credentials=credentials, project=project))
+    except Exception as exc:
+        _update_cloud_status(False, f"GCP credentials/client: {type(exc).__name__}: {exc}")
         return None, None
 
+
+def get_cloud_bucket_name() -> str:
+    # CONFIG is initialized on the main Streamlit thread before background sync.
+    return str(CONFIG["GCP_BUCKET"]).strip()
+
+
+def configure_cloud_from_secrets() -> None:
+    """Read Streamlit secrets only on the main script thread."""
+    bucket = _get_secret("GCP_BUCKET") or _get_secret("GCS_BUCKET")
+    if bucket:
+        CONFIG["GCP_BUCKET"] = str(bucket).strip()
 
 STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
 ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {"tier": "unknown", "detail": ""}
@@ -1656,13 +1748,15 @@ class YOLOFireSmokeDetector:
             return empty
 
         try:
-            results = self.model(
-                frame,
-                imgsz=CONFIG["YOLO_IMAGE_SIZE"],
-                conf=CONFIG["YOLO_CONFIDENCE"],
-                verbose=False,
-                device="cpu",
-            )
+            # Ultralytics shares predictor state; protect the cached model across sessions.
+            with YOLO_INFERENCE_LOCK:
+                results = self.model(
+                    frame,
+                    imgsz=ResourceGovernor.yolo_image_size(),
+                    conf=CONFIG["YOLO_CONFIDENCE"],
+                    verbose=False,
+                    device="cpu",
+                )
 
             if not results:
                 return empty
@@ -1681,6 +1775,15 @@ class YOLOFireSmokeDetector:
                     else:
                         class_name = str(names[cls_id]).lower()
 
+                    # Model labels outside fire/smoke must not create hazards.
+                    if "fire" in class_name:
+                        threshold = CONFIG["YOLO_FIRE_CONFIDENCE"]
+                    elif "smoke" in class_name:
+                        threshold = CONFIG["YOLO_SMOKE_CONFIDENCE"]
+                    else:
+                        continue
+                    if confidence < threshold:
+                        continue
                     xyxy = box.xyxy[0].tolist()
                     detections.append({
                         "class": class_name,
@@ -1688,7 +1791,7 @@ class YOLOFireSmokeDetector:
                         "box": [int(v) for v in xyxy],
                     })
 
-            annotated = result.plot() if detections else frame
+            annotated = self.draw_boxes_on_frame(frame, {"detections": detections}) if detections else frame
 
             return {
                 "detected": bool(detections),
@@ -1776,13 +1879,14 @@ class YOLOFireSmokeDetector:
 # =============================================================================
 class VisualFireSmokeDetector:
     @staticmethod
-    def detect(frame: np.ndarray) -> Dict[str, Any]:
+    def detect(frame: np.ndarray, previous_frame: Optional[np.ndarray] = None) -> Dict[str, Any]:
         if frame is None or frame.size == 0:
             return {
                 "visual_severity": "NORMAL",
                 "visual_keyword": "",
                 "fire_ratio": 0.0,
                 "smoke_ratio": 0.0,
+                "smoke_motion_ratio": 0.0,
             }
 
         bgr = frame
@@ -1817,6 +1921,16 @@ class VisualFireSmokeDetector:
 
         smoke_pixels = low_saturation & mid_brightness & gray_dominance
         smoke_mask = smoke_pixels.astype(np.uint8) * 255
+        # A stationary gray wall also passes the color mask. Prefer moving gray
+        # plumes in live mode rather than making a hazardous wall-only alert.
+        smoke_motion_ratio = 0.0
+        if previous_frame is not None and previous_frame.shape == frame.shape:
+            diff = cv2.absdiff(
+                cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
+                cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY),
+            )
+            moving_smoke = (diff > 12) & smoke_pixels
+            smoke_motion_ratio = float(np.count_nonzero(moving_smoke)) / max(1, frame.shape[0] * frame.shape[1])
 
         total_pixels = frame.shape[0] * frame.shape[1]
         fire_ratio = float(cv2.countNonZero(fire_mask)) / total_pixels
@@ -1861,6 +1975,7 @@ class VisualFireSmokeDetector:
             "visual_keyword": keyword,
             "fire_ratio": fire_ratio,
             "smoke_ratio": smoke_ratio,
+            "smoke_motion_ratio": smoke_motion_ratio,
         }
 
 
@@ -2018,8 +2133,10 @@ class YARAVerifier:
             "matched_source": matched_source,
             "yara_severity": yara_severity,
             "visual_severity": visual_severity,
+            "visual_keyword": visual_result.get("visual_keyword", ""),
             "fire_ratio": visual_result.get("fire_ratio", 0.0),
             "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
+            "smoke_motion_ratio": visual_result.get("smoke_motion_ratio", 0.0),
             "yara_available": YARA_AVAILABLE,
         }
 
@@ -2027,122 +2144,85 @@ class YARAVerifier:
 # =============================================================================
 # GOOGLE CLOUD FORENSIC BACKUP & LOCAL BUFFER
 # =============================================================================
-def _queue_image_for_later_upload(frame: np.ndarray, alert: Dict[str, Any]) -> None:
+def _queue_image_for_later_upload(frame: np.ndarray, alert: Dict[str, Any]) -> bool:
+    """Persist JPEG and JSON before handing control to a daemon thread."""
+    pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
     try:
-        pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
         os.makedirs(pending_dir, exist_ok=True)
-
-        stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        severity = alert.get("severity", "UNKNOWN")
-        base_name = f"{severity}_{stamp}"
-
-        ok, buffer = cv2.imencode(".jpg", frame)
+        event_uuid = str(alert["event_id"])
+        ok, buffer = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 80])
         if not ok:
-            return
-
-        with open(os.path.join(pending_dir, f"{base_name}.jpg"), "wb") as f:
+            raise ValueError("OpenCV JPEG encoding failed")
+        image_path = os.path.join(pending_dir, f"{event_uuid}.jpg")
+        meta_path = os.path.join(pending_dir, f"{event_uuid}.json")
+        with open(image_path + ".tmp", "wb") as f:
             f.write(buffer.tobytes())
-
-        with open(os.path.join(pending_dir, f"{base_name}.json"), "w") as f:
+        os.replace(image_path + ".tmp", image_path)
+        with open(meta_path + ".tmp", "w", encoding="utf-8") as f:
             json.dump(alert, f, default=str)
-    except Exception:
-        pass
+        os.replace(meta_path + ".tmp", meta_path)
+        return True
+    except Exception as exc:
+        _update_cloud_status(False, f"Local backup queue: {type(exc).__name__}: {exc}")
+        return False
 
 
-def flush_pending_cloud_uploads() -> None:
-    if not GCP_AVAILABLE or storage is None:
+def flush_pending_cloud_uploads(client=None) -> None:
+    if not GCP_AVAILABLE:
         return
-    if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
-        return
-
     pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
     if not os.path.isdir(pending_dir):
         return
-
-    try:
+    if client is None:
         client, _ = get_gcp_clients()
-        if client is None:
-            return
-        bucket = client.bucket(CONFIG["GCP_BUCKET"])
-    except Exception:
+    if client is None:
         return
-
+    bucket = client.bucket(get_cloud_bucket_name())
     for filename in sorted(os.listdir(pending_dir)):
         if not filename.endswith(".jpg"):
             continue
-
-        base_name = filename[:-4]
+        event_uuid = filename[:-4]
         image_path = os.path.join(pending_dir, filename)
-        meta_path = os.path.join(pending_dir, f"{base_name}.json")
-
+        meta_path = os.path.join(pending_dir, event_uuid + ".json")
+        # We only upload complete pairs to avoid a partially-written metadata file.
+        if not os.path.isfile(meta_path):
+            continue
         try:
             with open(image_path, "rb") as f:
                 image_bytes = f.read()
-
-            bucket.blob(f"cybervision_alerts/{base_name}.jpg").upload_from_string(
-                image_bytes, content_type="image/jpeg"
-            )
-
-            if os.path.isfile(meta_path):
-                with open(meta_path, "r") as f:
-                    meta_text = f.read()
-                bucket.blob(f"cybervision_alerts/{base_name}.json").upload_from_string(
-                    meta_text, content_type="application/json"
-                )
-                os.remove(meta_path)
-
+            with open(meta_path, "rb") as f:
+                meta_bytes = f.read()
+            # Stable object keys + retry-safe overwrites.
+            bucket.blob(f"cybervision_alerts/{event_uuid}.jpg").upload_from_string(
+                image_bytes, content_type="image/jpeg", timeout=20)
+            bucket.blob(f"cybervision_alerts/{event_uuid}.json").upload_from_string(
+                meta_bytes, content_type="application/json", timeout=20)
             os.remove(image_path)
-        except Exception:
-            continue
+            os.remove(meta_path)
+            _update_cloud_status(True, "Storage image and metadata uploaded", service="storage")
+        except Exception as exc:
+            _update_cloud_status(False, f"Cloud Storage: {type(exc).__name__}: {exc}", service="storage")
+            # Keep both files for the next retry.
+            break
 
 
-def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud_sync_enabled: bool) -> None:
-    # `cloud_sync_enabled` is read on the script thread and passed in: a plain
-    # background thread has no session context to read st.session_state.
-    def _worker():
-        save_event_locally(
-            time.time(),
-            alert.get("severity", "UNKNOWN"),
-            alert.get("description", ""),
-            camera_id="CAM_01"
-        )
-
-        if not cloud_sync_enabled or not GCP_AVAILABLE or storage is None:
-            return
-
-        if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
-            return
-
-        if not is_wifi_connected():
-            _queue_image_for_later_upload(frame, alert)
-            return
-
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            severity = alert.get("severity", "UNKNOWN")
-
-            image_name = f"cybervision_alerts/{severity}_{timestamp}.jpg"
-            log_name = f"cybervision_alerts/{severity}_{timestamp}.json"
-
-            ok, buffer = cv2.imencode(".jpg", frame)
-            if not ok:
-                return
-
-            client, _ = get_gcp_clients()
-            if client is None:
-                _queue_image_for_later_upload(frame, alert)
-                return
-            bucket = client.bucket(CONFIG["GCP_BUCKET"])
-
-            bucket.blob(image_name).upload_from_string(buffer.tobytes(), content_type="image/jpeg")
-            bucket.blob(log_name).upload_from_string(
-                json.dumps(alert, default=str), content_type="application/json"
-            )
-        except Exception:
-            _queue_image_for_later_upload(frame, alert)
-
-    threading.Thread(target=_worker, daemon=True).start()
-
+def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any],
+                                 cloud_sync_enabled: bool) -> None:
+    event_uuid = uuid.uuid4().hex
+    event = {**alert, "event_id": event_uuid, "camera_id": "CAM_01"}
+    # Always save local event. When cloud is off it must not later sync on its own.
+    try:
+        save_event_locally(time.time(), event.get("severity", "UNKNOWN"),
+                           event.get("description", ""), event_uuid=event_uuid,
+                           cloud_enabled=cloud_sync_enabled)
+    except Exception as exc:
+        _update_cloud_status(False, f"SQLite event queue: {type(exc).__name__}: {exc}")
+    if not cloud_sync_enabled:
+        return
+    if not _queue_image_for_later_upload(frame, event):
+        return
+    # The global lock keeps an upload burst from creating concurrent flushes.
+    threading.Thread(target=sync_cloud_once, daemon=True, name="cybervision-upload").start()
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -2150,35 +2230,52 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud
 def determine_hazard_title(latest: Dict[str, Any]) -> str:
     if not latest or latest.get("severity") == "NORMAL":
         return "Environment is Safe"
-
-    classes = [c.strip().lower() for c in latest.get("yolo_classes", "").split(",") if c.strip()]
-    description = latest.get("description", "").lower()
-    keyword = str(latest.get("matched_keyword", "")).lower()
-
-    has_fire = (
-        any("fire" in item for item in classes)
-        or "fire" in description
-        or "fire" in keyword
-        or latest.get("fire_ratio", 0) > 0.010
-    )
-
-    has_smoke = (
-        any("smoke" in item for item in classes)
-        or "smoke" in description
-        or "smoke" in keyword
-        or latest.get("smoke_ratio", 0) > 0.10
-    )
-
-    if has_fire:
+    hazard_type = str(latest.get("hazard_type", "")).upper()
+    if hazard_type == "FIRE":
         return "Fire Detected"
-    if has_smoke:
+    if hazard_type == "SMOKE":
         return "Smoke Detected"
+    # Fallback for existing records.
+    candidates = str(latest.get("yolo_classes", "")).lower()
+    keyword = str(latest.get("matched_keyword", "")).lower()
+    return "Fire Detected" if ("fire" in candidates or "fire" in keyword) else "Smoke Detected"
 
-    if "fire" in description or "fire" in keyword:
-        return "Fire Detected"
 
-    return "Smoke Detected"
+def resolve_hazard(yolo_result: Dict[str, Any], verdict: Dict[str, Any],
+                   smoke_streak: int = 0, fire_streak: int = 0,
+                   snapshot: bool = False) -> Tuple[str, str, float, str]:
+    """Return (severity, type, confidence, source).
 
+    YOLO is primary. Visual HSV heuristics are a fallback requiring 2 samples
+    for live scenes, to reduce alerts from stationary gray backgrounds.
+    """
+    detections = yolo_result.get("detections", [])
+    yolo_items = []
+    for det in detections:
+        label = str(det.get("class", "")).lower()
+        confidence = float(det.get("confidence", 0))
+        if "fire" in label and confidence >= CONFIG["YOLO_FIRE_CONFIDENCE"]:
+            severity = "CRITICAL" if confidence >= 0.50 else "HIGH"
+            yolo_items.append((SEVERITY_STYLE[severity]["score"], confidence, "FIRE", severity))
+        elif "smoke" in label and confidence >= CONFIG["YOLO_SMOKE_CONFIDENCE"]:
+            severity = "HIGH" if confidence >= 0.30 else "MEDIUM"
+            yolo_items.append((SEVERITY_STYLE[severity]["score"], confidence, "SMOKE", severity))
+    if yolo_items:
+        _, confidence, hazard_type, severity = max(yolo_items)
+        return severity, hazard_type, confidence, "YOLO_DETECTOR"
+
+    visual_sev = verdict.get("visual_severity", "NORMAL")
+    visual_type = str(verdict.get("visual_keyword", verdict.get("matched_keyword", ""))).lower()
+    if visual_sev != "NORMAL":
+        is_fire = "fire" in visual_type
+        is_smoke = "smoke" in visual_type
+        confirmed = snapshot or (fire_streak >= 2 if is_fire else smoke_streak >= 2)
+        if is_smoke and not snapshot:
+            # Avoid treating unmoving gray scenery as smoke in a live video.
+            confirmed = confirmed and float(verdict.get("smoke_motion_ratio", 0.0)) >= 0.012
+        if confirmed and (is_fire or is_smoke):
+            return visual_sev, "FIRE" if is_fire else "SMOKE", float(verdict.get("confidence", 0.0)), "OPENCV_VISUAL_FALLBACK"
+    return "NORMAL", "", 0.0, "SYSTEM"
 
 # =============================================================================
 # DETECTION PIPELINE
@@ -2263,21 +2360,31 @@ def run_detection_pipeline(
             "classes": [], "annotated_frame": frame,
         }
 
-    yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
-    st.session_state.yolo_severity = yolo_severity
 
     run_visual_now = (
         sync
         or st.session_state.get("last_visual_result") is None
-        or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"]) == 0
+        or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"] *
+                               (1 + ResourceGovernor.level())) == 0
     )
     if run_visual_now:
-        visual_result = VisualFireSmokeDetector.detect(frame)
+        visual_result = VisualFireSmokeDetector.detect(
+            frame, st.session_state.get("visual_prev_frame") if not sync else None
+        )
+        st.session_state.visual_prev_frame = frame.copy()
         st.session_state.last_visual_result = visual_result
     else:
         visual_result = st.session_state.last_visual_result
 
-    candidate_hazard = yolo_result.get("detected", False)
+    visual_keyword = str(visual_result.get("visual_keyword", ""))
+    if run_visual_now:
+        st.session_state.visual_smoke_streak = (
+            st.session_state.get("visual_smoke_streak", 0) + 1 if "smoke" in visual_keyword else 0
+        )
+        st.session_state.visual_fire_streak = (
+            st.session_state.get("visual_fire_streak", 0) + 1 if "fire" in visual_keyword else 0
+        )
+    candidate_hazard = bool(yolo_result.get("detected")) or visual_result.get("visual_severity") != "NORMAL"
     analyze_this_frame = candidate_hazard and (
         sync or frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
     )
@@ -2289,7 +2396,14 @@ def run_detection_pipeline(
     if not vlm_text:
         vlm_text = "NORMAL: Monitoring active."
 
-    verdict = YARAVerifier.verify(vlm_text, visual_result)
+    verdict = YARAVerifier.verify(vlm_text if candidate_hazard else "", visual_result)
+    severity, hazard_type, confidence, hazard_source = resolve_hazard(
+        yolo_result, verdict,
+        st.session_state.get("visual_smoke_streak", 0),
+        st.session_state.get("visual_fire_streak", 0),
+        snapshot=sync,
+    )
+    st.session_state.yolo_severity = severity  # existing dashboard metric name
 
     latency = time.time() - start_time
     st.session_state.latency_history.append(latency)
@@ -2299,44 +2413,52 @@ def run_detection_pipeline(
         detection_text = ", ".join(f"{d['class']} {d['confidence']:.0%}" for d in yolo_result["detections"])
         public_description = f"YOLO detected: {detection_text}. VLM: {vlm_text}"
 
-    is_hazard = yolo_result.get("detected", False)
-    confidence = yolo_result.get("highest_confidence", 0.0) if is_hazard else 0.0
+    is_hazard = severity != "NORMAL"
+    if is_hazard and hazard_source == "OPENCV_VISUAL_FALLBACK":
+        public_description = (f"Visual analysis suggests {hazard_type.lower()} "
+                              f"({visual_result.get('visual_keyword', 'visual')}). "
+                              f"YOLO: no matching object. VLM: {vlm_text}")
 
     alert = {
         "timestamp": datetime.now().strftime("%H:%M:%S"),
         "description": public_description,
         "success": True,
         "latency": latency,
-        "verified": is_hazard,
-        "yolo_detected": is_hazard,
+        "verified": hazard_source == "YOLO_DETECTOR",
+        "yolo_detected": bool(yolo_result.get("detected")),
         "yolo_classes": ", ".join(yolo_result.get("classes", [])),
         "yolo_confidence": confidence,
-        "severity": yolo_severity,
+        "severity": severity,
+        "hazard_type": hazard_type,
         "is_hazard": is_hazard,
         "confidence": confidence,
         "matched_keyword": verdict.get("matched_keyword", "none"),
-        "matched_source": "YOLO_DETECTOR" if is_hazard else "SYSTEM",
+        "matched_source": hazard_source,
         "yara_severity": verdict.get("yara_severity", "NORMAL"),
         "visual_severity": visual_result.get("visual_severity", "NORMAL"),
         "fire_ratio": visual_result.get("fire_ratio", 0.0),
         "smoke_ratio": visual_result.get("smoke_ratio", 0.0),
+        "smoke_motion_ratio": visual_result.get("smoke_motion_ratio", 0.0),
         "yara_available": YARA_AVAILABLE,
     }
 
     st.session_state.alert_history.append(alert)
     st.session_state.latest_detection = alert
 
-    if yolo_severity != "NORMAL":
+    if is_hazard:
         hazard_title = determine_hazard_title(alert)
-        dispatch_hazard_alerts(yolo_severity, hazard_title)
+        dispatch_hazard_alerts(severity, hazard_title)
 
-    play_critical_alarm(yolo_severity == "CRITICAL")
+    play_critical_alarm(severity == "CRITICAL")
 
     # Throttle uploads: otherwise every tick writes a SQLite row + Firestore doc.
     if is_hazard:
         now = time.time()
-        if now - st.session_state.get("last_cloud_upload_ts", 0.0) >= CONFIG["CLOUD_UPLOAD_MIN_INTERVAL_SEC"]:
+        # New hazard type is a new event even within the upload cool-down.
+        if (now - st.session_state.get("last_cloud_upload_ts", 0.0) >= CONFIG["CLOUD_UPLOAD_MIN_INTERVAL_SEC"]
+                or hazard_type != st.session_state.get("last_cloud_hazard_type", "")):
             st.session_state.last_cloud_upload_ts = now
+            st.session_state.last_cloud_hazard_type = hazard_type
             upload_to_google_cloud_async(
                 frame, dict(alert), bool(st.session_state.cloud_sync_enabled)
             )
@@ -2495,12 +2617,8 @@ def render_dashboard_settings_panel() -> None:
             value=st.session_state.sound_enabled,
         )
 
-        wifi_online = is_wifi_connected()
-        sync_label = (
-            "Data synced _to cloud_"
-            if (st.session_state.cloud_sync_enabled and wifi_online)
-            else "Data synced _locally_"
-        )
+        sync_label = ("Cloud backup enabled" if st.session_state.cloud_sync_enabled
+                      else "Local backup only")
         st.session_state.cloud_sync_enabled = st.toggle(
             sync_label,
             value=st.session_state.cloud_sync_enabled,
@@ -2509,12 +2627,43 @@ def render_dashboard_settings_panel() -> None:
         if st.session_state.cloud_sync_enabled:
             if not GCP_AVAILABLE:
                 st.caption(":material/error: `google-cloud-firestore` / `google-cloud-storage` not installed.")
-            elif CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+            elif get_cloud_bucket_name() == "your-gcp-bucket-name":
                 st.caption(":material/warning: Set CONFIG[\"GCP_BUCKET\"] / GCP_PROJECT_ID in main.py.")
             elif _get_gcp_service_account_info() is None:
                 st.caption(":material/warning: No GCP credentials found (secrets, env var, or key file).")
             else:
-                st.caption(":material/check_circle: GCP credentials loaded.")
+                with CLOUD_STATUS_LOCK:
+                    cloud_status = dict(CLOUD_STATUS)
+                if cloud_status["last_error"]:
+                    st.warning(f"Cloud sync error: {cloud_status['last_error']}")
+                elif cloud_status["last_success"]:
+                    st.caption(f":material/check_circle: {cloud_status['last_success']}")
+                else:
+                    st.caption("Credentials found. Waiting for a hazard event or cloud test.")
+                if st.button("Test Google Cloud", key="test_gcp_button"):
+                    client, db = get_gcp_clients()
+                    try:
+                        if client is None or db is None:
+                            raise RuntimeError("Google Cloud clients not initialized")
+                        bucket = client.bucket(get_cloud_bucket_name())
+                        marker_id = "test_" + uuid.uuid4().hex
+                        blob = bucket.blob("cybervision_diagnostics/" + marker_id + ".json")
+                        blob.upload_from_string('{"test":true}', content_type="application/json")
+                        doc = db.collection("cybervision_diagnostics").document(marker_id)
+                        doc.set({"test": True, "timestamp": firestore.SERVER_TIMESTAMP})
+                        # Object-creator role need not have delete or bucket-metadata access.
+                        try:
+                            blob.delete()
+                            doc.delete()
+                        except Exception:
+                            pass
+                        st.success("Storage and Firestore write permissions confirmed.")
+                    except Exception as exc:
+                        st.error(f"Cloud test failed: {type(exc).__name__}: {exc}")
+
+        level = st.session_state.get("resource_throttle_level", 0)
+        st.caption(f"Inference throttle: level {level} — " +
+                   ("normal" if level == 0 else "reduced frequency" if level == 1 else "heavy reduction"))
 
         timeout_option = st.selectbox(
             "Inference timeout target",
@@ -2750,10 +2899,15 @@ def _live_webrtc_body() -> None:
 
         status_slot.empty()
 
+        # Real throttling: skip expensive pipeline ticks under system pressure.
+        tick = time.time()
+        st.session_state.fps = fps
+        if tick - st.session_state.get("last_pipeline_ts", 0) < ResourceGovernor.pipeline_interval():
+            return
+        st.session_state.last_pipeline_ts = tick
         h, w = frame.shape[:2]
         st.session_state.last_resolution = f"{w}x{h}"
-        st.session_state.fps = fps
-        st.session_state.last_frame_time = time.time()
+        st.session_state.last_frame_time = tick
         st.session_state.frames_processed += 1
 
         target_w = CONFIG["WEBRTC_ANALYSIS_WIDTH"]
@@ -2916,6 +3070,12 @@ def render_video_feed() -> None:
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.yolo_detection = None
             st.session_state.yolo_detection_in_progress = False
+            st.session_state.visual_smoke_streak = 0
+            st.session_state.visual_fire_streak = 0
+            st.session_state.visual_prev_frame = None
+            st.session_state.last_visual_result = None
+            st.session_state.last_pipeline_ts = 0.0
+            st.session_state.last_cloud_hazard_type = ""
             st.session_state.alarm_active = False
             st.session_state.active_hazard_toast = None
             st.session_state._frame_processing_busy = False
@@ -2935,6 +3095,8 @@ def render_video_feed() -> None:
             st.session_state._frame_processing_busy = False
             st.session_state._frame_processing_busy_since = 0.0
             st.session_state.get("_cam_holder", {}).clear()
+            st.session_state.last_visual_result = None
+            st.session_state.visual_prev_frame = None
             release_camera()
             st.rerun()
 
