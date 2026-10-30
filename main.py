@@ -865,19 +865,27 @@ def inject_custom_css() -> None:
             color: {accent_dark};
         }}
 
-        /* BROWSER CAMERA LINK: must stay VISIBLE. When this widget was squeezed
-           to 1px / opacity 0.01 the browser throttled it and the stream never
-           connected. It is now a normal, small preview. */
+        /* BROWSER CAMERA LINK: invisible to the user but still FULL SIZE and
+           inside the viewport. Browsers throttle widgets that are 1px / display:none
+           / scrolled off-screen, which stalls the connection. Here it is simply
+           fully transparent, out of the page flow and behind everything, so only
+           the 3x3 grid is seen. */
         .st-key-webrtc_transport {{
-            max-width: {preview_px + 40}px;
+            position: fixed !important;
+            right: 0 !important;
+            bottom: 0 !important;
+            width: {preview_px}px !important;
+            height: 200px !important;
+            opacity: 0 !important;
+            pointer-events: none !important;
+            z-index: -1 !important;
+            overflow: hidden !important;
         }}
 
         .st-key-webrtc_transport video {{
             width: {preview_px}px !important;
             max-width: 100% !important;
             height: auto !important;
-            border-radius: 10px !important;
-            background: #000;
         }}
         </style>
         """,
@@ -1350,7 +1358,6 @@ def render_browser_camera_widget() -> None:
         return proc
 
     with st.container(key="webrtc_transport"):
-        st.caption("Camera link — click **Allow** when your browser asks for camera access.")
         ctx = webrtc_streamer(
             key="cybervision-browser-camera",
             mode=WebRtcMode.SENDRECV,
@@ -1394,8 +1401,7 @@ def render_browser_camera_widget() -> None:
             icon=":material/warning:",
         )
 
-    st.caption(ice_note)
-    st.caption(f"Link status: playing={playing} · negotiating={signalling}")
+
 
 
 # =============================================================================
@@ -2732,8 +2738,7 @@ def _connection_help_text() -> str:
     return (
         "Still no video from your browser. Where it stops: " + stage + ". "
         "Check: (1) the page is opened over HTTPS and you clicked Allow on the camera prompt "
-        "(lock icon in the address bar if it never appeared); (2) no other app is using the camera; "
-        "(3) the small camera preview above shows your face. "
+        "(lock icon in the address bar if it never appeared); (2) no other app is using the camera. "
         f"Relay: {tier}{' - ' + detail if detail else ''}. "
         "If it still will not connect, set 'Browser camera mode' to Snapshot - that works without WebRTC."
     )
