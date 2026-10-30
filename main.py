@@ -141,7 +141,7 @@ CONFIG: Dict[str, Any] = {
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
     "WEBRTC_ANALYSIS_WIDTH": 320,       # browser-camera frames are analysed at this width
     "WEBRTC_TICK_SEC": 0.5,             # alert/stat tick in browser-camera mode (draws no images)
-    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 0.3,  # min gap between YOLO runs inside the video processor
+    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 0.3,  # default gap between YOLO runs (throttle profiles override it)
     "WEBRTC_YOLO_RESULT_TTL_SEC": 1.5,  # boxes older than this are dropped
     "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,    # a frame older than this counts as "no signal"
     "SNAPSHOT_ANALYSIS_WIDTH": 640,
@@ -162,18 +162,42 @@ CONFIG: Dict[str, Any] = {
     "YARA_RULE_PATH": "hazard_rules.yar",
     # GCP Credentials & Bucket Configuration
     "GCP_BUCKET": "cybervision_history",
-    "GCP_PROJECT_ID": "c5c505d599a4735f61c6c6896dd3f47a2c28337b",
+    # Put your REAL GCP project ID here (e.g. "my-project-123456"), or set the
+    # GCP_PROJECT_ID env var. It is only used when the service-account info
+    # does not carry its own "project_id".
+    "GCP_PROJECT_ID": os.environ.get("GCP_PROJECT_ID", ""),
     "DB_FILE": os.path.join(_DATA_DIR, "cybervision_buffer.db"),
     "PENDING_UPLOADS_DIR": os.path.join(_DATA_DIR, "pending_gcp_uploads"),
     "YOLO_MODEL_PATH": os.path.join(
         os.path.dirname(os.path.abspath(__file__)),
         "YOLO_dataset.pt",
     ),
-    "YOLO_CONFIDENCE": 0.45,
-    "YOLO_IMAGE_SIZE": 160,
+    # Floor passed to the model; the real thresholds are per class below.
+    "YOLO_CONFIDENCE": 0.20,
+    "YOLO_CLASS_CONFIDENCE": {"fire": 0.45, "smoke": 0.25},
+    # YOLO image size now comes from the throttle profile (320 / 256 / 192).
     "YOLO_EVERY_N_FRAMES": 6,
     "VISUAL_DETECT_EVERY_N_FRAMES": 3,
+    # Resource throttling
+    "THROTTLE_LEVEL1_CPU": 70,
+    "THROTTLE_LEVEL1_RAM": 80,
+    "THROTTLE_LEVEL2_CPU": 85,
+    "THROTTLE_LEVEL2_RAM": 90,
+    "THROTTLE_PROFILES": {
+        0: {"yolo_interval": 0.3, "yolo_imgsz": 320, "every_n_mult": 1, "frame_gap": 0.0,  "tick": 0.5, "vlm": True,  "visual": True},
+        1: {"yolo_interval": 0.8, "yolo_imgsz": 256, "every_n_mult": 2, "frame_gap": 0.25, "tick": 1.0, "vlm": True,  "visual": True},
+        2: {"yolo_interval": 1.5, "yolo_imgsz": 192, "every_n_mult": 4, "frame_gap": 0.6,  "tick": 2.0, "vlm": False, "visual": False},
+    },
 }
+
+# Throttle state lives at module level: WebRTC worker threads cannot read
+# st.session_state, but they can read this.
+_THROTTLE: Dict[str, Any] = {"level": 0, "cpu": 0.0, "ram": 0.0}
+
+
+def get_throttle_profile() -> Dict[str, Any]:
+    return CONFIG["THROTTLE_PROFILES"][_THROTTLE["level"]]
+
 
 SEVERITY_STYLE = {
     "NORMAL": {"score": 0, "icon": ":material/check_circle:", "color": "#30d158"},
@@ -194,6 +218,17 @@ EMPTY_YOLO_RESULT: Dict[str, Any] = {
     "highest_confidence": 0.0,
     "classes": [],
 }
+
+
+# =============================================================================
+# GCP SHARED STATE (module level so background threads can use it)
+# =============================================================================
+_GCP_STATE: Dict[str, Any] = {"clients": None, "last_try": 0.0, "error": "", "last_ok": ""}
+_GCP_LOCK = threading.Lock()
+
+
+def _gcp_note_error(stage: str, exc: Exception) -> None:
+    _GCP_STATE["error"] = f"{stage}: {type(exc).__name__}: {exc}"
 
 
 # =============================================================================
@@ -229,17 +264,22 @@ _WIFI_CHECK_CACHE: Dict[str, Any] = {"checked_at": 0.0, "online": False}
 _WIFI_CHECK_TTL_SECONDS = 15.0
 
 
-def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: float = 1.0) -> bool:
+def is_wifi_connected(timeout: float = 2.0) -> bool:
     # Cached: called on every rerun (sidebar, settings panel, sync thread).
+    # Probes HTTPS endpoints (port 443) because many hosts/networks block
+    # raw DNS to 8.8.8.8:53, which made the app think it was always offline.
     now = time.time()
     if now - _WIFI_CHECK_CACHE["checked_at"] < _WIFI_CHECK_TTL_SECONDS:
         return bool(_WIFI_CHECK_CACHE["online"])
 
-    try:
-        with socket.create_connection((host, port), timeout=timeout):
-            online = True
-    except OSError:
-        online = False
+    online = False
+    for host, port in (("storage.googleapis.com", 443), ("1.1.1.1", 443)):
+        try:
+            with socket.create_connection((host, port), timeout=timeout):
+                online = True
+                break
+        except OSError:
+            continue
 
     _WIFI_CHECK_CACHE["checked_at"] = now
     _WIFI_CHECK_CACHE["online"] = online
@@ -252,7 +292,7 @@ def sync_worker_loop() -> None:
             try:
                 _, db_client = get_gcp_clients()
                 if db_client is None:
-                    raise RuntimeError("GCP credentials not configured")
+                    raise RuntimeError(_GCP_STATE["error"] or "GCP credentials not configured")
                 with sqlite3.connect(CONFIG["DB_FILE"]) as conn:
                     cursor = conn.cursor()
                     cursor.execute("SELECT id, timestamp, severity, description, camera_id FROM pending_events WHERE synced = 0")
@@ -270,8 +310,8 @@ def sync_worker_loop() -> None:
                         })
                         cursor.execute("UPDATE pending_events SET synced = 1 WHERE id = ?", (event_id,))
                     conn.commit()
-            except Exception:
-                pass
+            except Exception as exc:
+                _gcp_note_error("firestore sync", exc)
 
             flush_pending_cloud_uploads()
         time.sleep(10)
@@ -286,6 +326,12 @@ def _start_sync_thread_once() -> bool:
 
 
 def start_sync_thread() -> None:
+    # Build the GCP clients on the script thread first, so st.secrets is read
+    # here and the background thread just reuses the ready clients.
+    try:
+        get_gcp_clients()
+    except Exception:
+        pass
     _start_sync_thread_once()
 
 
@@ -333,6 +379,7 @@ def init_session_state() -> None:
         "webrtc_ctx": None,
         "_frame_processing_busy": False,
         "_frame_processing_busy_since": 0.0,
+        "_last_tick_ts": 0.0,
     }
 
     for key, value in defaults.items():
@@ -957,54 +1004,87 @@ def render_custom_hazard_toast() -> None:
 
 
 # =============================================================================
-# SYSTEM MONITORING
+# SYSTEM MONITORING & RESOURCE THROTTLING
 # =============================================================================
+psutil.cpu_percent(interval=None)  # prime: the first call always returns 0.0
+_METRICS_CACHE: Dict[str, Any] = {"ts": 0.0, "data": None}
+_METRICS_LOCK = threading.Lock()
+
+
 class SystemMonitor:
+    @staticmethod
+    def _sample() -> Dict[str, Any]:
+        # Sampled at most once per second and shared by every caller, so the
+        # reading is stable and the throttle level updates from one source.
+        with _METRICS_LOCK:
+            now = time.time()
+            if _METRICS_CACHE["data"] is None or now - _METRICS_CACHE["ts"] >= 1.0:
+                cpu = float(psutil.cpu_percent(interval=None))
+                ram = float(psutil.virtual_memory().percent)
+                _METRICS_CACHE["ts"] = now
+                _METRICS_CACHE["data"] = {
+                    "time": datetime.now().strftime("%H:%M:%S"),
+                    "cpu": cpu,
+                    "ram": ram,
+                    "ts": now,
+                }
+                ResourceGovernor.update_level(cpu, ram)
+            return dict(_METRICS_CACHE["data"])
+
     @staticmethod
     def get_metrics() -> Dict[str, Any]:
         try:
-            cpu = float(psutil.cpu_percent(interval=0.01))
-            ram = float(psutil.virtual_memory().percent)
-
-            metrics = {
-                "time": datetime.now().strftime("%H:%M:%S"),
-                "cpu": cpu,
-                "ram": ram,
-            }
-
-            st.session_state.metrics_history.append(metrics)
-            return metrics
+            m = SystemMonitor._sample()
+            hist = st.session_state.metrics_history
+            if not hist or hist[-1].get("ts") != m["ts"]:
+                hist.append(m)
+            return m
         except Exception:
             return {
                 "time": datetime.now().strftime("%H:%M:%S"),
                 "cpu": 0.0,
                 "ram": 0.0,
+                "ts": 0.0,
             }
 
 
 class ResourceGovernor:
     @staticmethod
-    def check_resource_pressure() -> None:
-        metrics = SystemMonitor.get_metrics()
-        cpu = metrics["cpu"]
-        ram = metrics["ram"]
-
-        if cpu >= CONFIG["CPU_THRESHOLD"] or ram >= CONFIG["RAM_THRESHOLD"]:
-            st.session_state.system_status = "RESOURCE_PRESSURE"
-            st.session_state.vlm_context = "REDUCED"
-            st.session_state.last_public_notice = (
-                f"Resource pressure detected. CPU={cpu:.1f}%, RAM={ram:.1f}%. "
-                "Using reduced context."
-            )
+    def update_level(cpu: float, ram: float) -> int:
+        c, cur = CONFIG, _THROTTLE["level"]
+        if cpu >= c["THROTTLE_LEVEL2_CPU"] or ram >= c["THROTTLE_LEVEL2_RAM"]:
+            new = 2
+        elif cpu >= c["THROTTLE_LEVEL1_CPU"] or ram >= c["THROTTLE_LEVEL1_RAM"]:
+            new = 1
         else:
-            st.session_state.system_status = "HEALTHY"
-            st.session_state.vlm_context = "ACTIVE"
-            st.session_state.last_public_notice = ""
+            new = 0
+
+        if new < cur:
+            # Hysteresis: only step down once 5 points below the trigger.
+            lim = {
+                2: (c["THROTTLE_LEVEL2_CPU"], c["THROTTLE_LEVEL2_RAM"]),
+                1: (c["THROTTLE_LEVEL1_CPU"], c["THROTTLE_LEVEL1_RAM"]),
+            }[cur]
+            if cpu > lim[0] - 5 or ram > lim[1] - 5:
+                new = cur
+
+        _THROTTLE.update(level=new, cpu=cpu, ram=ram)
+        return new
+
+    @staticmethod
+    def check_resource_pressure() -> None:
+        m = SystemMonitor.get_metrics()
+        lvl = _THROTTLE["level"]
+        st.session_state.system_status = ["HEALTHY", "THROTTLED", "RESOURCE_PRESSURE"][lvl]
+        st.session_state.vlm_context = ["ACTIVE", "ACTIVE", "REDUCED"][lvl]
+        st.session_state.last_public_notice = (
+            f"Throttle level {lvl}: CPU={m['cpu']:.1f}%, RAM={m['ram']:.1f}%." if lvl else ""
+        )
 
     @staticmethod
     def recommended_token_budget() -> int:
-        metrics = SystemMonitor.get_metrics()
-        worst = max(metrics["cpu"], metrics["ram"])
+        m = SystemMonitor.get_metrics()
+        worst = max(m["cpu"], m["ram"])
 
         if worst >= 85:
             return 128
@@ -1078,7 +1158,7 @@ if WEBRTC_AVAILABLE:
                     self._detector is not None
                     and self._detector.available
                     and not self._yolo_busy
-                    and now - self._last_yolo_start >= CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"]
+                    and now - self._last_yolo_start >= get_throttle_profile()["yolo_interval"]
                 ):
                     self._yolo_busy = True
                     self._last_yolo_start = now
@@ -1183,26 +1263,49 @@ def _get_gcp_service_account_info() -> Optional[dict]:
     return None
 
 
-@st.cache_resource(show_spinner=False)
 def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
+    """Returns (storage_client, firestore_client).
+
+    Deliberately NOT cached with st.cache_resource: a single failed attempt
+    used to be cached forever as (None, None). Successful clients are kept in
+    module state; failures are retried every 15 seconds and the reason is
+    recorded in _GCP_STATE["error"] so the UI can show it.
+    """
     if not GCP_AVAILABLE:
+        _GCP_STATE["error"] = "google-cloud-storage / google-cloud-firestore not importable."
         return None, None
 
-    info = _get_gcp_service_account_info()
-    project_id = CONFIG["GCP_PROJECT_ID"]
+    with _GCP_LOCK:
+        if _GCP_STATE["clients"] is not None:
+            return _GCP_STATE["clients"]
+        if time.time() - _GCP_STATE["last_try"] < 15:  # retry, but not in a hot loop
+            return None, None
+        _GCP_STATE["last_try"] = time.time()
 
-    try:
-        if info and gcp_service_account is not None:
-            credentials = gcp_service_account.Credentials.from_service_account_info(info)
-            project_id = info.get("project_id", project_id)
-            storage_client = storage.Client(credentials=credentials, project=project_id)
-            db_client = firestore.Client(credentials=credentials, project=project_id)
-        else:
-            storage_client = storage.Client(project=project_id)
-            db_client = firestore.Client(project=project_id)
-        return storage_client, db_client
-    except Exception:
-        return None, None
+        try:
+            info = _get_gcp_service_account_info()
+            if info:
+                info = dict(info)
+                if "private_key" in info:
+                    info["private_key"] = info["private_key"].replace("\\n", "\n")
+                creds = gcp_service_account.Credentials.from_service_account_info(info)
+                project_id = info.get("project_id") or CONFIG["GCP_PROJECT_ID"] or None
+                clients = (
+                    storage.Client(credentials=creds, project=project_id),
+                    firestore.Client(credentials=creds, project=project_id),
+                )
+            else:
+                project_id = CONFIG["GCP_PROJECT_ID"] or None
+                clients = (
+                    storage.Client(project=project_id),
+                    firestore.Client(project=project_id),
+                )
+            _GCP_STATE["clients"] = clients
+            _GCP_STATE["error"] = ""
+            return clients
+        except Exception as exc:
+            _gcp_note_error("client init", exc)
+            return None, None
 
 
 STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
@@ -1583,6 +1686,8 @@ def get_yolo_debug_info() -> Dict[str, Any]:
             model = load_yolo_model()
             info["load_yolo_model() result"] = "loaded OK" if model is not None else "returned None"
             info["load exception"] = _yolo_state()["error"] or "(none)"
+            if model is not None:
+                info["model class names"] = str(getattr(model, "names", "?"))
         except Exception as exc:
             info["load_yolo_model() result"] = "raised an exception"
             info["load exception"] = f"{type(exc).__name__}: {exc}"
@@ -1658,7 +1763,7 @@ class YOLOFireSmokeDetector:
         try:
             results = self.model(
                 frame,
-                imgsz=CONFIG["YOLO_IMAGE_SIZE"],
+                imgsz=get_throttle_profile()["yolo_imgsz"],
                 conf=CONFIG["YOLO_CONFIDENCE"],
                 verbose=False,
                 device="cpu",
@@ -1681,6 +1786,15 @@ class YOLOFireSmokeDetector:
                     else:
                         class_name = str(names[cls_id]).lower()
 
+                    # Per-class confidence: smoke scores lower than fire, so a
+                    # single global floor was silently dropping every smoke box.
+                    min_conf = next(
+                        (v for k, v in CONFIG["YOLO_CLASS_CONFIDENCE"].items() if k in class_name),
+                        CONFIG["YOLO_CONFIDENCE"],
+                    )
+                    if confidence < min_conf:
+                        continue
+
                     xyxy = box.xyxy[0].tolist()
                     detections.append({
                         "class": class_name,
@@ -1688,7 +1802,9 @@ class YOLOFireSmokeDetector:
                         "box": [int(v) for v in xyxy],
                     })
 
-            annotated = result.plot() if detections else frame
+            # Boxes are drawn by draw_boxes_on_frame; result.plot() would also
+            # draw the boxes that were filtered out above.
+            annotated = frame
 
             return {
                 "detected": bool(detections),
@@ -1761,7 +1877,7 @@ class YOLOFireSmokeDetector:
             if "fire" in class_name:
                 candidate = "CRITICAL" if confidence >= 0.50 else "HIGH"
             elif "smoke" in class_name:
-                candidate = "HIGH" if confidence >= 0.30 else "MEDIUM"
+                candidate = "HIGH" if confidence >= 0.50 else "MEDIUM"
             else:
                 continue
 
@@ -2064,7 +2180,8 @@ def flush_pending_cloud_uploads() -> None:
         if client is None:
             return
         bucket = client.bucket(CONFIG["GCP_BUCKET"])
-    except Exception:
+    except Exception as exc:
+        _gcp_note_error("pending flush (bucket)", exc)
         return
 
     for filename in sorted(os.listdir(pending_dir)):
@@ -2092,13 +2209,20 @@ def flush_pending_cloud_uploads() -> None:
                 os.remove(meta_path)
 
             os.remove(image_path)
-        except Exception:
+            _GCP_STATE["error"] = ""
+            _GCP_STATE["last_ok"] = datetime.now().strftime("%H:%M:%S")
+        except Exception as exc:
+            _gcp_note_error("pending flush", exc)
             continue
 
 
 def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud_sync_enabled: bool) -> None:
     # `cloud_sync_enabled` is read on the script thread and passed in: a plain
     # background thread has no session context to read st.session_state.
+    if cloud_sync_enabled:
+        get_gcp_clients()  # prime on the script thread so st.secrets is read there
+    frame = frame.copy()
+
     def _worker():
         save_event_locally(
             time.time(),
@@ -2107,38 +2231,41 @@ def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud
             camera_id="CAM_01"
         )
 
-        if not cloud_sync_enabled or not GCP_AVAILABLE or storage is None:
+        if not cloud_sync_enabled:
             return
 
-        if CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
+        if not GCP_AVAILABLE or storage is None:
+            _GCP_STATE["error"] = "GCP libraries not installed."
             return
 
         if not is_wifi_connected():
+            _GCP_STATE["error"] = "Offline: image queued for later upload."
             _queue_image_for_later_upload(frame, alert)
             return
 
         try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            severity = alert.get("severity", "UNKNOWN")
+            client, _ = get_gcp_clients()
+            if client is None:
+                raise RuntimeError(_GCP_STATE["error"] or "GCP client unavailable")
 
-            image_name = f"cybervision_alerts/{severity}_{timestamp}.jpg"
-            log_name = f"cybervision_alerts/{severity}_{timestamp}.json"
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+            sev = alert.get("severity", "UNKNOWN")
 
-            ok, buffer = cv2.imencode(".jpg", frame)
+            ok, buf = cv2.imencode(".jpg", frame)
             if not ok:
                 return
 
-            client, _ = get_gcp_clients()
-            if client is None:
-                _queue_image_for_later_upload(frame, alert)
-                return
             bucket = client.bucket(CONFIG["GCP_BUCKET"])
-
-            bucket.blob(image_name).upload_from_string(buffer.tobytes(), content_type="image/jpeg")
-            bucket.blob(log_name).upload_from_string(
+            bucket.blob(f"cybervision_alerts/{sev}_{ts}.jpg").upload_from_string(
+                buf.tobytes(), content_type="image/jpeg"
+            )
+            bucket.blob(f"cybervision_alerts/{sev}_{ts}.json").upload_from_string(
                 json.dumps(alert, default=str), content_type="application/json"
             )
-        except Exception:
+            _GCP_STATE["error"] = ""
+            _GCP_STATE["last_ok"] = datetime.now().strftime("%H:%M:%S")
+        except Exception as exc:
+            _gcp_note_error("upload", exc)
             _queue_image_for_later_upload(frame, alert)
 
     threading.Thread(target=_worker, daemon=True).start()
@@ -2152,19 +2279,23 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
         return "Environment is Safe"
 
     classes = [c.strip().lower() for c in latest.get("yolo_classes", "").split(",") if c.strip()]
+
+    # Trust the YOLO classes first: the VLM text often says "no visible fire or
+    # smoke", which used to make smoke detections show up as "FIRE DETECTED".
+    if classes:
+        return "Fire Detected" if any("fire" in c for c in classes) else "Smoke Detected"
+
     description = latest.get("description", "").lower()
     keyword = str(latest.get("matched_keyword", "")).lower()
 
     has_fire = (
-        any("fire" in item for item in classes)
-        or "fire" in description
+        "fire" in description
         or "fire" in keyword
         or latest.get("fire_ratio", 0) > 0.010
     )
 
     has_smoke = (
-        any("smoke" in item for item in classes)
-        or "smoke" in description
+        "smoke" in description
         or "smoke" in keyword
         or latest.get("smoke_ratio", 0) > 0.10
     )
@@ -2225,6 +2356,7 @@ def run_detection_pipeline(
         }
 
     ResourceGovernor.check_resource_pressure()
+    profile = get_throttle_profile()
     start_time = time.time()
 
     VLMInference.drain_worker_queue()
@@ -2250,9 +2382,10 @@ def run_detection_pipeline(
         if err:
             st.session_state.last_error = err
     else:
+        every_n = max(1, CONFIG["YOLO_EVERY_N_FRAMES"] * profile["every_n_mult"])
         run_yolo_now = (
             st.session_state.get("yolo_detection") is None
-            or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"]) == 0
+            or frame_number % every_n == 0
         )
 
         if run_yolo_now:
@@ -2266,23 +2399,29 @@ def run_detection_pipeline(
     yolo_severity = yolo_detector.hazard_severity(yolo_result) if yolo_result.get("detected") else "NORMAL"
     st.session_state.yolo_severity = yolo_severity
 
-    run_visual_now = (
-        sync
-        or st.session_state.get("last_visual_result") is None
-        or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"]) == 0
+    run_visual_now = sync or (
+        profile["visual"] and (
+            st.session_state.get("last_visual_result") is None
+            or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"]) == 0
+        )
     )
     if run_visual_now:
         visual_result = VisualFireSmokeDetector.detect(frame)
         st.session_state.last_visual_result = visual_result
     else:
-        visual_result = st.session_state.last_visual_result
+        visual_result = st.session_state.get("last_visual_result") or {
+            "visual_severity": "NORMAL",
+            "visual_keyword": "",
+            "fire_ratio": 0.0,
+            "smoke_ratio": 0.0,
+        }
 
     candidate_hazard = yolo_result.get("detected", False)
     analyze_this_frame = candidate_hazard and (
         sync or frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
     )
 
-    if analyze_this_frame:
+    if analyze_this_frame and profile["vlm"]:
         VLMInference.trigger_async_inference(frame)
 
     vlm_text = st.session_state.get("latest_vlm_text", "")
@@ -2490,31 +2629,49 @@ def render_dashboard_settings_panel() -> None:
                 ),
             )
 
+        # The toggles use their own widget keys and copy the result into the
+        # persistent session values. Widget keys are dropped when the panel is
+        # not rendered (e.g. on the Analytics page); the copied values survive.
         st.session_state.sound_enabled = st.toggle(
             "Alert sound",
             value=st.session_state.sound_enabled,
+            key="sound_toggle_widget",
+        )
+
+        st.session_state.cloud_sync_enabled = st.toggle(
+            "Sync events to cloud",
+            value=st.session_state.cloud_sync_enabled,
+            key="cloud_sync_toggle_widget",
         )
 
         wifi_online = is_wifi_connected()
-        sync_label = (
-            "Data synced _to cloud_"
+        st.caption(
+            "Cloud sync active."
             if (st.session_state.cloud_sync_enabled and wifi_online)
-            else "Data synced _locally_"
-        )
-        st.session_state.cloud_sync_enabled = st.toggle(
-            sync_label,
-            value=st.session_state.cloud_sync_enabled,
+            else "Saving locally only."
         )
 
         if st.session_state.cloud_sync_enabled:
-            if not GCP_AVAILABLE:
-                st.caption(":material/error: `google-cloud-firestore` / `google-cloud-storage` not installed.")
-            elif CONFIG["GCP_BUCKET"] == "your-gcp-bucket-name":
-                st.caption(":material/warning: Set CONFIG[\"GCP_BUCKET\"] / GCP_PROJECT_ID in main.py.")
-            elif _get_gcp_service_account_info() is None:
-                st.caption(":material/warning: No GCP credentials found (secrets, env var, or key file).")
-            else:
-                st.caption(":material/check_circle: GCP credentials loaded.")
+            get_gcp_clients()
+            if _GCP_STATE["last_ok"]:
+                st.caption(f":material/check_circle: Last upload OK at {_GCP_STATE['last_ok']}.")
+            if _GCP_STATE["error"]:
+                st.caption(f":material/error: {_GCP_STATE['error']}")
+
+            if st.button("Test cloud connection", key="gcp_test_btn"):
+                try:
+                    client, db = get_gcp_clients()
+                    if client is None:
+                        raise RuntimeError(_GCP_STATE["error"] or "No GCP client.")
+                    client.bucket(CONFIG["GCP_BUCKET"]).blob(
+                        "cybervision_alerts/_connection_test.txt"
+                    ).upload_from_string(b"ok")
+                    db.collection("hazard_events").document("_connection_test").set(
+                        {"ok": True, "ts": firestore.SERVER_TIMESTAMP}
+                    )
+                    st.success("Storage and Firestore writes both worked.")
+                except Exception as exc:
+                    st.error(f"{type(exc).__name__}: {exc}")
 
         timeout_option = st.selectbox(
             "Inference timeout target",
@@ -2732,6 +2889,12 @@ def _live_webrtc_body() -> None:
     if _busy_flag_active():
         return
 
+    # Throttled: run the tick less often (the video itself keeps streaming).
+    if _THROTTLE["level"]:
+        if time.time() - st.session_state.get("_last_tick_ts", 0.0) < get_throttle_profile()["tick"] * 0.8:
+            return
+        st.session_state._last_tick_ts = time.time()
+
     st.session_state._frame_processing_busy = True
     st.session_state._frame_processing_busy_since = time.time()
     try:
@@ -2786,6 +2949,12 @@ def _live_local_camera_body() -> None:
 
     # A fragment rerun that draws nothing makes the previous image disappear.
     if _busy_flag_active():
+        _redraw_last_frame()
+        return
+
+    # Throttled: enforce a minimum gap between processed frames.
+    gap = get_throttle_profile()["frame_gap"]
+    if gap and time.time() - st.session_state.get("last_frame_time", 0.0) < gap:
         _redraw_last_frame()
         return
 
@@ -2920,6 +3089,7 @@ def render_video_feed() -> None:
             st.session_state.active_hazard_toast = None
             st.session_state._frame_processing_busy = False
             st.session_state._frame_processing_busy_since = 0.0
+            st.session_state._last_tick_ts = 0.0
 
             if st.session_state.get("yolo_detector") is None:
                 st.session_state.yolo_detector = YOLOFireSmokeDetector()
@@ -3067,8 +3237,16 @@ def render_analytics_page() -> None:
 
 def render_dashboard_page() -> None:
     metrics = SystemMonitor.get_metrics()
-    if metrics["cpu"] > 90.0 or metrics["ram"] > 88.0:
-        st.error(f"Critical System Load! CPU: {metrics['cpu']}% | RAM: {metrics['ram']}%. System throttling.", icon=":material/error:")
+    if _THROTTLE["level"] == 2:
+        st.error(
+            f"Critical system load (CPU {metrics['cpu']}%, RAM {metrics['ram']}%). Heavy throttling active.",
+            icon=":material/error:",
+        )
+    elif _THROTTLE["level"] == 1:
+        st.warning(
+            f"High load (CPU {metrics['cpu']}%, RAM {metrics['ram']}%). Detection is throttled.",
+            icon=":material/warning:",
+        )
 
     render_dashboard_header()
 
