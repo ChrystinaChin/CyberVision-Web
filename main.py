@@ -11,8 +11,8 @@ import tempfile
 import threading
 import time
 import wave
-from concurrent.futures import ThreadPoolExecutor
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Any, Dict, Optional, Tuple
 
@@ -82,11 +82,7 @@ except Exception:
 
 
 def is_cloud_environment() -> bool:
-    """Detect a hosted environment (Streamlit Community Cloud, Render, Cloud Run,
-    Heroku, HF Spaces, ...). A hosted server has no physical camera, so
-    cv2.VideoCapture can never see the *visitor's* webcam there. In that case the
-    app captures the visitor's own browser camera over WebRTC instead.
-    """
+    """Hosted server (no physical camera) -> use the visitor's browser camera."""
     force_webrtc = os.environ.get("CYBERVISION_FORCE_WEBRTC", "").strip().lower()
     if force_webrtc in ("1", "true", "yes"):
         return True
@@ -120,8 +116,7 @@ def local_camera_available() -> bool:
 
 
 def _writable_data_dir() -> str:
-    """Hosted file systems are often read-only next to the source. Fall back to
-    the OS temp dir so the SQLite buffer and pending uploads always work."""
+    """Hosted file systems are often read-only; fall back to the OS temp dir."""
     base = os.path.dirname(os.path.abspath(__file__))
     try:
         probe = os.path.join(base, ".cv_write_test")
@@ -144,13 +139,14 @@ CONFIG: Dict[str, Any] = {
     "VLM_MODEL": "moondream",
     "CAMERA_INDEX": 0,
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
-    "WEBRTC_ANALYSIS_WIDTH": 320,   # browser-camera frames are analysed at this width
-    "WEBRTC_TICK_SEC": 0.25,        # detection tick in browser-camera mode
-    "WEBRTC_PREVIEW_WIDTH_PX": 260, # size of the (visible) browser-camera preview
-    "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,  # a frame older than this counts as "no signal"
-    "SNAPSHOT_ANALYSIS_WIDTH": 640, # width used when analysing a snapshot photo
-    "CAMERA_CONNECT_HINT_SEC": 15,  # show troubleshooting help if no frame arrives by then
-    "BUSY_FLAG_TIMEOUT_SEC": 8.0,   # a stuck "busy" flag is ignored after this long
+    "WEBRTC_ANALYSIS_WIDTH": 320,       # browser-camera frames are analysed at this width
+    "WEBRTC_TICK_SEC": 0.5,             # alert/stat tick in browser-camera mode (draws no images)
+    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 0.3,  # min gap between YOLO runs inside the video processor
+    "WEBRTC_YOLO_RESULT_TTL_SEC": 1.5,  # boxes older than this are dropped
+    "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,    # a frame older than this counts as "no signal"
+    "SNAPSHOT_ANALYSIS_WIDTH": 640,
+    "CAMERA_CONNECT_HINT_SEC": 15,
+    "BUSY_FLAG_TIMEOUT_SEC": 8.0,
     "FRAME_WIDTH": 640,
     "FRAME_HEIGHT": 300,
     "JPEG_QUALITY": 70,
@@ -174,9 +170,9 @@ CONFIG: Dict[str, Any] = {
         "YOLO_dataset.pt",
     ),
     "YOLO_CONFIDENCE": 0.45,
-    "YOLO_IMAGE_SIZE": 160,       # Reduced from 320 to accelerate CPU inference
-    "YOLO_EVERY_N_FRAMES": 6,     # Run real inference every 6th tick; reuse last result otherwise
-    "VISUAL_DETECT_EVERY_N_FRAMES": 3,  # HSV/YCrCb color analysis is CPU-heavy; don't run it every tick
+    "YOLO_IMAGE_SIZE": 160,
+    "YOLO_EVERY_N_FRAMES": 6,
+    "VISUAL_DETECT_EVERY_N_FRAMES": 3,
 }
 
 SEVERITY_STYLE = {
@@ -191,6 +187,13 @@ BROWSER_MODE_SNAPSHOT = "Snapshot"
 
 VLM_RESULT_QUEUE: queue.Queue = queue.Queue()
 YOLO_RESULT_QUEUE: queue.Queue = queue.Queue()
+
+EMPTY_YOLO_RESULT: Dict[str, Any] = {
+    "detected": False,
+    "detections": [],
+    "highest_confidence": 0.0,
+    "classes": [],
+}
 
 
 # =============================================================================
@@ -227,8 +230,7 @@ _WIFI_CHECK_TTL_SECONDS = 15.0
 
 
 def is_wifi_connected(host: str = "8.8.8.8", port: int = 53, timeout: float = 1.0) -> bool:
-    # Cached for a few seconds: this is called on every rerun (sidebar, settings
-    # panel, sync thread).
+    # Cached: called on every rerun (sidebar, settings panel, sync thread).
     now = time.time()
     if now - _WIFI_CHECK_CACHE["checked_at"] < _WIFI_CHECK_TTL_SECONDS:
         return bool(_WIFI_CHECK_CACHE["online"])
@@ -299,6 +301,7 @@ def init_session_state() -> None:
         "last_frame_rgb": None,
         "last_snapshot_rgb": None,
         "_last_snapshot_sig": None,
+        "last_resolution": "",
         "frames_processed": 0,
         "last_analyzed_frame": 0,
         "inference_count": 0,
@@ -349,7 +352,6 @@ def inject_custom_css() -> None:
     muted = "#6b7280"
     accent = "#f97316"
     accent_dark = "#c2410c"
-    preview_px = CONFIG["WEBRTC_PREVIEW_WIDTH_PX"]
 
     st.markdown(
         f"""
@@ -362,7 +364,7 @@ def inject_custom_css() -> None:
             color: {text} !important;
         }}
 
-        /* STABILIZE LIVE VIDEO CONTAINER TO PREVENT DISAPPEARING/BLINKING */
+        /* Keep live elements fully visible while a fragment reruns */
         div[data-testid="stFragment"],
         [data-testid="stFragment"] > div,
         div[data-testid="stElementContainer"],
@@ -420,42 +422,6 @@ def inject_custom_css() -> None:
 
         .muted {{
             color: {muted};
-        }}
-
-        .hero {{
-            position: relative;
-            padding: 0.45rem 1.1rem;
-            background:
-                linear-gradient(135deg, rgba(255,255,255,0.96), rgba(255,237,213,0.96)),
-                radial-gradient(circle at top right, rgba(249,115,22,0.28), transparent 35%);
-            border: none;
-            border-radius: 20px;
-            margin-bottom: 0.4rem;
-            box-shadow: 0 10px 26px rgba(249,115,22,0.13);
-            overflow: hidden;
-        }}
-
-        .hero-title {{
-            font-size: 1.55rem;
-            font-weight: 900;
-            margin: 0.15rem 0 0 0;
-            color: {accent_dark};
-            letter-spacing: -0.03em;
-        }}
-
-        .pill {{
-            display: inline-flex;
-            align-items: center;
-            gap: 0.4rem;
-            padding: 0.22rem 0.65rem;
-            border-radius: 999px;
-            background: rgba(249,115,22,0.12);
-            border: none;
-            color: {accent_dark};
-            font-weight: 900;
-            font-size: 0.7rem;
-            letter-spacing: 0.04em;
-            text-transform: uppercase;
         }}
 
         div[data-testid="stMetric"] {{
@@ -526,15 +492,6 @@ def inject_custom_css() -> None:
             max-width: 420px;
         }}
 
-        .hazard-toast .toast-severity {{
-            display: flex;
-            align-items: center;
-            gap: 0.4rem;
-            font-weight: 900;
-            font-size: 1.15rem;
-            color: #1f2937;
-        }}
-
         .hazard-toast .toast-title {{
             font-weight: 700;
             font-size: 0.95rem;
@@ -565,18 +522,6 @@ def inject_custom_css() -> None:
             color: {muted};
             font-size: 0.8rem;
             margin-top: 0.45rem;
-        }}
-
-        .stTabs {{
-            margin-top: -0.3rem !important;
-        }}
-
-        .stTabs [data-baseweb="tab-list"] {{
-            gap: 1.2rem !important;
-        }}
-
-        .stTabs [data-baseweb="tab-panel"] {{
-            padding-top: 0.4rem !important;
         }}
 
         [data-testid="stSidebarContent"] {{
@@ -828,7 +773,6 @@ def inject_custom_css() -> None:
             border-radius: 50%;
         }}
 
-        /* Panels (video, stats, settings): no outline, no box */
         [data-testid="stVerticalBlockBorderWrapper"] {{
             background: transparent !important;
             border: none !important;
@@ -865,27 +809,19 @@ def inject_custom_css() -> None:
             color: {accent_dark};
         }}
 
-        /* BROWSER CAMERA LINK: invisible to the user but still FULL SIZE and
-           inside the viewport. Browsers throttle widgets that are 1px / display:none
-           / scrolled off-screen, which stalls the connection. Here it is simply
-           fully transparent, out of the page flow and behind everything, so only
-           the 3x3 grid is seen. */
+        /* BROWSER CAMERA: the WebRTC <video> IS the live display. The processor
+           draws the YOLO boxes + HUD onto the frames, so the browser plays a
+           real video stream: no st.image churn, no flicker. */
         .st-key-webrtc_transport {{
-            position: fixed !important;
-            right: 0 !important;
-            bottom: 0 !important;
-            width: {preview_px}px !important;
-            height: 200px !important;
-            opacity: 0 !important;
-            pointer-events: none !important;
-            z-index: -1 !important;
-            overflow: hidden !important;
+            width: 100% !important;
         }}
 
         .st-key-webrtc_transport video {{
-            width: {preview_px}px !important;
+            width: 100% !important;
             max-width: 100% !important;
             height: auto !important;
+            border-radius: 14px;
+            background: #111827;
         }}
         </style>
         """,
@@ -1085,39 +1021,103 @@ class ResourceGovernor:
 # =============================================================================
 if WEBRTC_AVAILABLE:
     class BrowserCameraProcessor(VideoProcessorBase):
-        """Receives frames from the visitor's browser camera.
+        """Runs in the WebRTC worker thread.
 
-        It only stores the latest frame and returns the ORIGINAL frame object
-        untouched (rebuilding frames without pts/time_base turns the stream
-        black). All attributes are initialised in __init__ so a read can never
-        raise AttributeError, and frames are no longer discarded for being dark.
+        * keeps the latest frame for the Streamlit side,
+        * runs YOLO in a small background thread (never blocks the stream),
+        * returns the frame WITH boxes + HUD drawn on it, so the browser's
+          native <video> element is the live display.
+
+        It never touches st.session_state (not thread-safe from this thread).
         """
 
-        def __init__(self) -> None:
+        def __init__(self, detector=None) -> None:
             self._lock = threading.Lock()
+            self._detector = detector
             self._latest_frame: Optional[np.ndarray] = None
             self._last_frame_ts: float = 0.0
             self.frames_received: int = 0
+            self._yolo_result: Optional[Dict[str, Any]] = None
+            self._yolo_result_ts: float = 0.0
+            self._yolo_busy: bool = False
+            self._last_yolo_start: float = 0.0
+            self._fps: float = 0.0
+            self._last_tick: float = time.time()
+
+        def _yolo_worker(self, img: np.ndarray) -> None:
+            result = None
+            try:
+                result = self._detector.detect(img)
+            except Exception:
+                pass
+            with self._lock:
+                if result is not None:
+                    self._yolo_result = result
+                    self._yolo_result_ts = time.time()
+                self._yolo_busy = False
 
         def recv(self, frame):
             try:
                 img = frame.to_ndarray(format="bgr24")
-                if img is not None and img.size:
-                    with self._lock:
-                        self._latest_frame = img
-                        self._last_frame_ts = time.time()
-                        self.frames_received += 1
             except Exception:
-                pass
-            return frame
+                return frame
 
-        def get_latest_frame(self) -> Optional[np.ndarray]:
+            now = time.time()
+            dt = now - self._last_tick
+            self._last_tick = now
+            if dt > 0:
+                inst = 1.0 / dt
+                self._fps = inst if not self._fps else 0.9 * self._fps + 0.1 * inst
+
+            start_yolo = False
             with self._lock:
-                if self._latest_frame is None:
-                    return None
-                if time.time() - self._last_frame_ts > CONFIG["WEBRTC_FRAME_MAX_AGE_SEC"]:
-                    return None
-                return self._latest_frame.copy()
+                self._latest_frame = img
+                self._last_frame_ts = now
+                self.frames_received += 1
+                if (
+                    self._detector is not None
+                    and self._detector.available
+                    and not self._yolo_busy
+                    and now - self._last_yolo_start >= CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"]
+                ):
+                    self._yolo_busy = True
+                    self._last_yolo_start = now
+                    start_yolo = True
+                fresh = now - self._yolo_result_ts < CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
+                yolo = self._yolo_result if fresh else None
+
+            if start_yolo:
+                threading.Thread(target=self._yolo_worker, args=(img.copy(),), daemon=True).start()
+
+            try:
+                out = img.copy()
+                if yolo and yolo.get("detections"):
+                    out = YOLOFireSmokeDetector.draw_boxes_on_frame(out, yolo)
+                status = "DETECTED" if (yolo and yolo.get("detected")) else "CLEAR"
+                cv2.putText(
+                    out,
+                    f"CAM_01 [LIVE]  FPS {self._fps:.0f} | YOLO {status}",
+                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
+                )
+                new_frame = av.VideoFrame.from_ndarray(out, format="bgr24")
+                new_frame.pts = frame.pts
+                new_frame.time_base = frame.time_base
+                return new_frame
+            except Exception:
+                return frame
+
+        def snapshot(self):
+            """(latest_frame_copy, fresh_yolo_result, fps) for the Streamlit side."""
+            with self._lock:
+                now = time.time()
+                if (
+                    self._latest_frame is None
+                    or now - self._last_frame_ts > CONFIG["WEBRTC_FRAME_MAX_AGE_SEC"]
+                ):
+                    return None, None, 0.0
+                fresh = now - self._yolo_result_ts < CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
+                yolo = self._yolo_result if fresh else None
+                return self._latest_frame.copy(), yolo, self._fps
 else:
     BrowserCameraProcessor = None
 
@@ -1329,15 +1329,10 @@ def _describe_ice_servers(ice_servers: list) -> str:
 
 
 def render_browser_camera_widget() -> None:
-    """Mounts the WebRTC connector that streams the VISITOR's webcam to the server.
+    """Mounts the WebRTC connector. Its <video> is the live, annotated display.
 
-    Notes:
-      * SENDRECV so streamlit-webrtc actually runs the video processor.
-      * The widget is a VISIBLE small preview. Hiding/shrinking it (1px, low
-        opacity) makes browsers throttle it and the connection never completes.
-      * The processor returns the original frame untouched so the stream never
-        goes black.
-      * The main display is the server-rendered 3x3 grid drawn by the fragment.
+    SENDRECV: the browser sends its camera, the server-side processor draws the
+    detections on each frame and sends the annotated video straight back.
     """
     if not WEBRTC_AVAILABLE:
         st.error(
@@ -1349,11 +1344,17 @@ def render_browser_camera_widget() -> None:
         return
 
     ice_servers = get_ice_servers()
-
     holder = st.session_state.setdefault("_cam_holder", {})
 
+    # Create the detector here, on the script thread, and hand it to the
+    # processor (the factory itself runs in a WebRTC worker thread).
+    detector = st.session_state.get("yolo_detector")
+    if detector is None:
+        detector = YOLOFireSmokeDetector()
+        st.session_state.yolo_detector = detector
+
     def _processor_factory():
-        proc = BrowserCameraProcessor()
+        proc = BrowserCameraProcessor(detector)
         holder["proc"] = proc
         return proc
 
@@ -1378,9 +1379,9 @@ def render_browser_camera_widget() -> None:
                 "muted": True,
                 "playsInline": True,
                 "style": {
-                    "width": f"{CONFIG['WEBRTC_PREVIEW_WIDTH_PX']}px",
+                    "width": "100%",
                     "maxWidth": "100%",
-                    "borderRadius": "10px",
+                    "borderRadius": "14px",
                 },
             },
             async_processing=True,
@@ -1390,7 +1391,6 @@ def render_browser_camera_widget() -> None:
 
     state = getattr(ctx, "state", None)
     playing = bool(state is not None and getattr(state, "playing", False))
-    signalling = bool(state is not None and getattr(state, "signalling", False))
     ice_note = _describe_ice_servers(ice_servers)
 
     if ice_note.startswith(":material/info:") and not playing:
@@ -1402,10 +1402,8 @@ def render_browser_camera_widget() -> None:
         )
 
 
-
-
 # =============================================================================
-# MULTI-CAMERA HANDLING & 3x3 MATRIX
+# LOCAL CAMERA HANDLING & 3x3 MATRIX (localhost behaviour of the working project)
 # =============================================================================
 @st.cache_resource(show_spinner=False)
 def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
@@ -1495,36 +1493,7 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
 
 class VideoCaptureManager:
     @staticmethod
-    def capture_active_frames() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
-        if st.session_state.get("use_webrtc"):
-            return VideoCaptureManager._capture_from_browser()
-        return VideoCaptureManager._capture_from_local_devices()
-
-    @staticmethod
-    def _capture_from_browser() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
-        processor = _get_browser_processor()
-        if processor is None:
-            st.session_state.last_error = "Waiting for browser camera permission..."
-            return {}, None
-
-        frame = processor.get_latest_frame()
-        if frame is None:
-            st.session_state.last_error = "Waiting for first frame from browser camera..."
-            return {}, None
-
-        # Keep the camera's real aspect ratio, and analyse a small copy.
-        h, w = frame.shape[:2]
-        target_w = CONFIG["WEBRTC_ANALYSIS_WIDTH"]
-        target_h = max(1, int(round(h * target_w / max(w, 1))))
-        primary_frame = cv2.resize(frame, (target_w, target_h))
-
-        if str(st.session_state.get("last_error", "")).startswith("Waiting for"):
-            st.session_state.last_error = ""
-
-        return {0: primary_frame}, primary_frame
-
-    @staticmethod
-    def _capture_from_local_devices() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
+    def capture_local_frames() -> Tuple[Dict[int, np.ndarray], Optional[np.ndarray]]:
         caps = get_camera_caps()
         active_frames = {}
         primary_frame = None
@@ -1564,26 +1533,10 @@ class VideoCaptureManager:
         )
         frame[:] = (22, 28, 55)
 
-        cv2.putText(
-            frame,
-            message,
-            (55, 140),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            1.0,
-            (0, 255, 170),
-            2,
-        )
+        cv2.putText(frame, message, (55, 140), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 170), 2)
 
         if subtext:
-            cv2.putText(
-                frame,
-                subtext,
-                (55, 185),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.6,
-                (220, 220, 220),
-                1,
-            )
+            cv2.putText(frame, subtext, (55, 185), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (220, 220, 220), 1)
 
         return cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
@@ -1962,10 +1915,9 @@ class VLMInference:
         if st.session_state.get("vlm_in_progress", False):
             return
 
-        # Ollama on "localhost" only exists on your own machine. On a hosted
-        # deployment, set OLLAMA_HOST (env var or secret) to a reachable server;
-        # without it the VLM step is skipped and detection continues with YOLO +
-        # the OpenCV fallback.
+        # "localhost" Ollama only exists on your own machine. On a hosted
+        # deployment set OLLAMA_HOST (env var or secret) to a reachable server;
+        # without it the VLM step is skipped and detection continues with YOLO.
         host = _get_secret("OLLAMA_HOST")
         if is_cloud_environment() and not host:
             return
@@ -2145,8 +2097,8 @@ def flush_pending_cloud_uploads() -> None:
 
 
 def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any], cloud_sync_enabled: bool) -> None:
-    # `cloud_sync_enabled` is read on the Streamlit script thread and passed in:
-    # a plain background thread has no session context to read st.session_state.
+    # `cloud_sync_enabled` is read on the script thread and passed in: a plain
+    # background thread has no session context to read st.session_state.
     def _worker():
         save_event_locally(
             time.time(),
@@ -2231,13 +2183,17 @@ def determine_hazard_title(latest: Dict[str, Any]) -> str:
 # =============================================================================
 # DETECTION PIPELINE
 # =============================================================================
-def run_detection_pipeline(frame: np.ndarray, sync: bool = False) -> Dict[str, Any]:
+def run_detection_pipeline(
+    frame: np.ndarray,
+    sync: bool = False,
+    yolo_override: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Run the full detection pipeline on one frame.
 
-    sync=False (live stream): YOLO runs in a background thread and its result is
-    picked up on a later tick.
-    sync=True (snapshot photo): YOLO runs right now so the single photo gets its
-    own result immediately.
+    yolo_override: YOLO result already computed elsewhere (the browser-camera
+        video processor); the pipeline then skips its own YOLO call.
+    sync=True: snapshot photo, run YOLO right now.
+    otherwise: YOLO runs in a background thread and is picked up on a later tick.
     """
     if frame is None or frame.size == 0:
         default_alert = {
@@ -2283,7 +2239,10 @@ def run_detection_pipeline(frame: np.ndarray, sync: bool = False) -> Dict[str, A
 
     frame_number = st.session_state.frames_processed
 
-    if sync:
+    if yolo_override is not None:
+        yolo_result = yolo_override
+        st.session_state.yolo_detection = yolo_result
+    elif sync:
         yolo_result = yolo_detector.detect(frame)
         st.session_state.yolo_detection = yolo_result
         st.session_state.inference_count += 1
@@ -2291,10 +2250,9 @@ def run_detection_pipeline(frame: np.ndarray, sync: bool = False) -> Dict[str, A
         if err:
             st.session_state.last_error = err
     else:
-        yolo_every = 2 if st.session_state.get("use_webrtc") else CONFIG["YOLO_EVERY_N_FRAMES"]
         run_yolo_now = (
             st.session_state.get("yolo_detection") is None
-            or frame_number % max(1, yolo_every) == 0
+            or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"]) == 0
         )
 
         if run_yolo_now:
@@ -2374,8 +2332,7 @@ def run_detection_pipeline(frame: np.ndarray, sync: bool = False) -> Dict[str, A
 
     play_critical_alarm(yolo_severity == "CRITICAL")
 
-    # Throttle uploads: otherwise every tick writes a SQLite row + Firestore doc
-    # + bucket objects.
+    # Throttle uploads: otherwise every tick writes a SQLite row + Firestore doc.
     if is_hazard:
         now = time.time()
         if now - st.session_state.get("last_cloud_upload_ts", 0.0) >= CONFIG["CLOUD_UPLOAD_MIN_INTERVAL_SEC"]:
@@ -2667,18 +2624,20 @@ def render_live_stats_panel() -> None:
     st.fragment(_render_live_stats_body, run_every=refresh)()
 
 
-def render_video_status_bar() -> None:
+def _render_video_status_bar_body() -> None:
     fps = st.session_state.get("fps", 0.0)
     avg_latency = (
         sum(st.session_state.latency_history) / len(st.session_state.latency_history)
         if st.session_state.latency_history else 0.0
     )
 
-    last_rgb = st.session_state.get("last_frame_rgb")
-    if last_rgb is not None:
-        resolution = f"{last_rgb.shape[1]}x{last_rgb.shape[0]}"
-    else:
-        resolution = f"{CONFIG['FRAME_WIDTH']}x{CONFIG['FRAME_HEIGHT']}"
+    resolution = st.session_state.get("last_resolution") or ""
+    if not resolution:
+        last_rgb = st.session_state.get("last_frame_rgb")
+        if last_rgb is not None:
+            resolution = f"{last_rgb.shape[1]}x{last_rgb.shape[0]}"
+        else:
+            resolution = f"{CONFIG['FRAME_WIDTH']}x{CONFIG['FRAME_HEIGHT']}"
 
     st.markdown(
         f"""
@@ -2692,6 +2651,12 @@ def render_video_status_bar() -> None:
     )
 
 
+def render_video_status_bar() -> None:
+    # Its own fragment, so it refreshes on its own while the camera runs.
+    refresh = 1.0 if st.session_state.get("camera_running") else None
+    st.fragment(_render_video_status_bar_body, run_every=refresh)()
+
+
 def render_resource_trend_preview() -> None:
     metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
     if metrics_df.empty:
@@ -2702,7 +2667,7 @@ def render_resource_trend_preview() -> None:
 
 
 # =============================================================================
-# LIVE VIDEO STREAM
+# LIVE VIDEO
 # =============================================================================
 def _show_frame(slot, image, **kwargs) -> None:
     """Draw an image into a slot; works on old and new Streamlit versions."""
@@ -2713,8 +2678,13 @@ def _show_frame(slot, image, **kwargs) -> None:
 
 
 def live_camera_fragment() -> None:
-    interval = CONFIG["WEBRTC_TICK_SEC"] if st.session_state.get("use_webrtc") else 0.1
-    st.fragment(_live_camera_body, run_every=interval)()
+    if st.session_state.get("use_webrtc"):
+        # Browser camera: the WebRTC <video> shows the stream. This fragment
+        # draws NO images; it only feeds alerts, stats and uploads.
+        st.fragment(_live_webrtc_body, run_every=CONFIG["WEBRTC_TICK_SEC"])()
+    else:
+        # Local webcam: the exact flow of the working localhost project.
+        st.fragment(_live_local_camera_body, run_every=0.1)()
 
 
 def _connection_help_text() -> str:
@@ -2727,7 +2697,6 @@ def _connection_help_text() -> str:
             "the browser has NOT connected to the server yet (no video processor was created, "
             "so the WebRTC handshake never finished)"
         )
-        frames = 0
     else:
         frames = int(getattr(processor, "frames_received", 0))
         if frames == 0:
@@ -2746,17 +2715,62 @@ def _connection_help_text() -> str:
 
 def _busy_flag_active() -> bool:
     """True if another tick is genuinely still processing. A flag older than
-    BUSY_FLAG_TIMEOUT_SEC is treated as stale (e.g. a run that was interrupted)."""
+    BUSY_FLAG_TIMEOUT_SEC is treated as stale (e.g. an interrupted run)."""
     if not st.session_state.get("_frame_processing_busy"):
         return False
     since = st.session_state.get("_frame_processing_busy_since", 0.0)
     return (time.time() - since) < CONFIG["BUSY_FLAG_TIMEOUT_SEC"]
 
 
-def _live_camera_body() -> None:
-    # The frame/status slots are created INSIDE the fragment. A placeholder
-    # created outside and passed in raises StreamlitInvalidLayoutContextError when
-    # the fragment reruns on its own (run_every).
+def _live_webrtc_body() -> None:
+    status_slot = st.empty()
+    render_custom_hazard_toast()
+
+    if not st.session_state.get("camera_running", False):
+        return
+
+    if _busy_flag_active():
+        return
+
+    st.session_state._frame_processing_busy = True
+    st.session_state._frame_processing_busy_since = time.time()
+    try:
+        processor = _get_browser_processor()
+        frame, yolo, fps = (None, None, 0.0)
+        if processor is not None:
+            frame, yolo, fps = processor.snapshot()
+
+        if frame is None:
+            waited = time.time() - (st.session_state.get("camera_started_at") or time.time())
+            if waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
+                status_slot.warning(_connection_help_text(), icon=":material/warning:")
+            else:
+                status_slot.info("Waiting for browser camera… click Allow on the camera prompt.")
+            return
+
+        status_slot.empty()
+
+        h, w = frame.shape[:2]
+        st.session_state.last_resolution = f"{w}x{h}"
+        st.session_state.fps = fps
+        st.session_state.last_frame_time = time.time()
+        st.session_state.frames_processed += 1
+
+        target_w = CONFIG["WEBRTC_ANALYSIS_WIDTH"]
+        target_h = max(1, int(round(h * target_w / max(w, 1))))
+        small = cv2.resize(frame, (target_w, target_h))
+
+        # YOLO boxes in `yolo` are in full-frame coordinates; the pipeline only
+        # needs the detections/severity, not the pixels.
+        run_detection_pipeline(small, yolo_override=yolo or dict(EMPTY_YOLO_RESULT))
+    finally:
+        st.session_state._frame_processing_busy = False
+
+
+def _live_local_camera_body() -> None:
+    # The slots are created INSIDE the fragment: a placeholder created outside
+    # and passed in raises StreamlitInvalidLayoutContextError on newer Streamlit
+    # when the fragment reruns on its own (run_every).
     frame_slot = st.empty()
     status_slot = st.empty()
 
@@ -2770,8 +2784,7 @@ def _live_camera_body() -> None:
     if not st.session_state.get("camera_running", False):
         return
 
-    # A fragment rerun that draws nothing makes the previous image disappear, so
-    # when we skip a tick we must redraw the last grid (in BOTH camera modes).
+    # A fragment rerun that draws nothing makes the previous image disappear.
     if _busy_flag_active():
         _redraw_last_frame()
         return
@@ -2779,8 +2792,7 @@ def _live_camera_body() -> None:
     st.session_state._frame_processing_busy = True
     st.session_state._frame_processing_busy_since = time.time()
     try:
-        use_webrtc = bool(st.session_state.get("use_webrtc"))
-        active_frames, primary_frame = VideoCaptureManager.capture_active_frames()
+        active_frames, primary_frame = VideoCaptureManager.capture_local_frames()
 
         if primary_frame is None and not active_frames:
             if st.session_state.get("last_frame_rgb") is not None:
@@ -2788,23 +2800,11 @@ def _live_camera_body() -> None:
             else:
                 _show_frame(
                     frame_slot,
-                    VideoCaptureManager.placeholder_frame(
-                        "Starting camera...",
-                        "Allow camera access in your browser." if use_webrtc else "Opening local camera.",
-                    ),
+                    VideoCaptureManager.placeholder_frame("Starting camera...", "Opening local camera."),
                     channels="RGB",
                     output_format="JPEG",
                 )
-
-            message = st.session_state.get("last_error") or "Camera unavailable."
-            if use_webrtc:
-                waited = time.time() - (st.session_state.get("camera_started_at") or time.time())
-                if waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
-                    status_slot.warning(_connection_help_text(), icon=":material/warning:")
-                else:
-                    status_slot.info(message)
-            else:
-                status_slot.error(message)
+            status_slot.error(st.session_state.get("last_error") or "Camera unavailable.")
             return
 
         current_time = time.time()
@@ -2821,8 +2821,6 @@ def _live_camera_body() -> None:
         if 0 in active_frames and primary_frame is not None:
             active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(primary_frame, yolo_result)
 
-        # 3x3 grid in BOTH modes: the live camera is CAM_01, the other eight
-        # tiles show "NO CAMERA DETECTED".
         display = construct_3x3_grid(active_frames)
 
         severity = st.session_state.get("yolo_severity", "NORMAL")
@@ -2850,7 +2848,6 @@ def _live_camera_body() -> None:
 def render_snapshot_camera() -> None:
     """Fallback camera: take a photo with the browser camera (st.camera_input)
     and analyse it. Needs no WebRTC / TURN, so it works on any hosted app."""
-    # Make sure no live-stream state lingers while in snapshot mode.
     st.session_state.camera_running = False
     st.session_state.get("_cam_holder", {}).clear()
 
@@ -2899,7 +2896,6 @@ def render_snapshot_camera() -> None:
 
 
 def render_video_feed() -> None:
-    # Snapshot fallback (browser camera without WebRTC)
     if _browser_snapshot_mode():
         render_snapshot_camera()
         return
@@ -2915,6 +2911,7 @@ def render_video_feed() -> None:
             st.session_state.last_frame_time = time.time()
             st.session_state.camera_started_at = time.time()
             st.session_state.last_frame_rgb = None
+            st.session_state.last_resolution = ""
             st.session_state.latest_detection = None
             st.session_state.yolo_severity = "NORMAL"
             st.session_state.yolo_detection = None
@@ -2961,8 +2958,7 @@ def render_video_feed() -> None:
         return
 
     # The WebRTC connector is only mounted while the camera is running, so
-    # pressing Stop also releases the visitor's webcam. It is a small VISIBLE
-    # preview; the main display is the 3x3 grid drawn by the fragment below.
+    # pressing Stop also releases the visitor's webcam.
     if st.session_state.get("use_webrtc"):
         render_browser_camera_widget()
 
