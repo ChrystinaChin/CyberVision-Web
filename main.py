@@ -24,6 +24,12 @@ import pandas as pd
 import psutil
 import streamlit as st
 
+# Prevent OpenCV helper operations from competing with the WebRTC encoder.
+try:
+    cv2.setNumThreads(1)
+except Exception:
+    pass
+
 LOG = logging.getLogger("cybervision")
 CLOUD_STATUS_LOCK = threading.Lock()
 CLOUD_STATUS = {"last_success": "", "last_error": "", "last_attempt": "",
@@ -170,7 +176,10 @@ CONFIG: Dict[str, Any] = {
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
     "WEBRTC_ANALYSIS_WIDTH": 320,       # browser-camera frames are analysed at this width
     "WEBRTC_TICK_SEC": 0.75,            # alert/stat tick in browser-camera mode (draws no images)
-    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 0.8,  # adaptive governor raises this during pressure  # min gap between YOLO runs inside the video processor
+    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 1.25,  # YOLO stays off the real-time video path
+    "WEBRTC_SAMPLE_INTERVAL_SEC": 0.25,  # maximum 4 sampled analysis frames / second
+    "WEBRTC_STALL_WARNING_SEC": 6.0,  # show a reconnect action once frames stop
+    "YOLO_CPU_THREADS": 2,  # leave CPU capacity for WebRTC video encoding
     "WEBRTC_YOLO_RESULT_TTL_SEC": 3.0,  # boxes older than this are dropped
     "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,    # a frame older than this counts as "no signal"
     "SNAPSHOT_ANALYSIS_WIDTH": 640,
@@ -393,6 +402,7 @@ def init_session_state() -> None:
         "active_page": "Dashboard",
         "browser_cam_mode": BROWSER_MODE_LIVE,
         "webrtc_ctx": None,
+        "webrtc_connection_id": 0,
         "_frame_processing_busy": False,
         "_frame_processing_busy_since": 0.0,
     }
@@ -1109,11 +1119,11 @@ class ResourceGovernor:
 
     @staticmethod
     def yolo_interval() -> float:
-        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 1.4, 2.2)[ResourceGovernor.level()]
+        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 2.5, 4.0)[ResourceGovernor.level()]
 
     @staticmethod
     def pipeline_interval() -> float:
-        return (0.75, 1.25, 2.0)[ResourceGovernor.level()]
+        return (0.75, 1.50, 2.5)[ResourceGovernor.level()]
 
     @staticmethod
     def yolo_image_size() -> int:
@@ -1130,85 +1140,105 @@ class ResourceGovernor:
 # =============================================================================
 if WEBRTC_AVAILABLE:
     class BrowserCameraProcessor(VideoProcessorBase):
-        """Runs in the WebRTC worker thread.
+        """Keep WebRTC transmission independent of expensive AI inference.
 
-        * keeps the latest frame for the Streamlit side,
-        * runs YOLO in a small background thread (never blocks the stream),
-        * returns the frame WITH boxes + HUD drawn on it, so the browser's
-          native <video> element is the live display.
-
-        It never touches st.session_state (not thread-safe from this thread).
+        recv() is called for every video frame, but converts pixels only for an
+        occasional detection sample, and hands that sample to a bounded worker.
+        Frames without detection boxes are returned unmodified. This avoids
+        constant PyAV frame creation, OpenCV work and extra CPU/memory pressure.
+        No Streamlit calls occur on the WebRTC worker threads.
         """
 
         def __init__(self, detector=None) -> None:
             self._lock = threading.Lock()
             self._detector = detector
             self._latest_frame: Optional[np.ndarray] = None
-            self._last_frame_ts: float = 0.0
-            self.frames_received: int = 0
+            self._last_frame_ts = 0.0
+            self._last_sample_ts = 0.0
+            self._last_sample_attempt_ts = 0.0
+            self.frames_received = 0
             self._yolo_result: Optional[Dict[str, Any]] = None
-            self._yolo_result_ts: float = 0.0
-            self._yolo_busy: bool = False
-            self._last_yolo_start: float = 0.0
-            self._fps: float = 0.0
-            self._last_tick: float = time.time()
+            self._yolo_result_ts = 0.0
+            self._yolo_busy = False
+            self._last_yolo_start = 0.0
+            self._fps = 0.0
+            self._last_tick = 0.0
+            self._ended = False
 
         def _yolo_worker(self, img: np.ndarray) -> None:
-            result = None
             try:
                 result = self._detector.detect(img)
             except Exception as exc:
                 result = {**EMPTY_YOLO_RESULT, "error": str(exc)}
-            with self._lock:
-                if result is not None:
-                    self._yolo_result = result
-                    self._yolo_result_ts = time.time()
-                self._yolo_busy = False
+            finally:
+                # Even if inference raises, allow the next scheduled sample.
+                with self._lock:
+                    if "result" in locals():
+                        self._yolo_result = result
+                        self._yolo_result_ts = time.monotonic()
+                    self._yolo_busy = False
 
         def recv(self, frame):
-            try:
-                img = frame.to_ndarray(format="bgr24")
-            except Exception:
-                return frame
-
-            now = time.time()
-            dt = now - self._last_tick
-            self._last_tick = now
-            if dt > 0:
-                inst = 1.0 / dt
-                self._fps = inst if not self._fps else 0.9 * self._fps + 0.1 * inst
-
-            start_yolo = False
+            now = time.monotonic()
+            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"]
             with self._lock:
-                self._latest_frame = img
+                previous = self._last_tick
+                self._last_tick = now
                 self._last_frame_ts = now
                 self.frames_received += 1
-                if (
-                    self._detector is not None
-                    and self._detector.available
-                    and not self._yolo_busy
-                    and now - self._last_yolo_start >= ResourceGovernor.yolo_interval()
-                ):
-                    self._yolo_busy = True
-                    self._last_yolo_start = now
-                    start_yolo = True
-                fresh = now - self._yolo_result_ts < CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
-                yolo = self._yolo_result if fresh else None
+                self._ended = False
+                if previous and now > previous:
+                    instant_fps = min(120.0, 1.0 / (now - previous))
+                    self._fps = instant_fps if not self._fps else (0.85 * self._fps + 0.15 * instant_fps)
+                needs_sample = now - self._last_sample_attempt_ts >= sample_interval
+                if needs_sample:
+                    self._last_sample_attempt_ts = now
+                recent = now - self._yolo_result_ts <= CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
+                yolo = self._yolo_result if recent else None
 
-            if start_yolo:
-                threading.Thread(target=self._yolo_worker, args=(img.copy(),), daemon=True).start()
+            sample = None
+            if needs_sample:
+                try:
+                    # Decode to ndarray only 4 times/s, not for every WebRTC frame.
+                    sample = frame.to_ndarray(format="bgr24")
+                except Exception:
+                    sample = None
+
+            start_yolo = False
+            if sample is not None:
+                with self._lock:
+                    self._latest_frame = sample
+                    # Sample timestamp reflects when the video was received, not
+                    # when the Streamlit analysis fragment next polls it.
+                    self._last_sample_ts = now
+                    if (
+                        self._detector is not None and self._detector.available
+                        and not self._yolo_busy
+                        and now - self._last_yolo_start >= ResourceGovernor.yolo_interval()
+                    ):
+                        self._yolo_busy = True
+                        self._last_yolo_start = now
+                        start_yolo = True
+                if start_yolo:
+                    try:
+                        threading.Thread(target=self._yolo_worker, args=(sample,),
+                                         daemon=True, name="cybervision-yolo").start()
+                    except RuntimeError as exc:
+                        # Resource-constrained hosts can reject new threads.
+                        # Preserve the WebRTC stream even when YOLO cannot start.
+                        with self._lock:
+                            self._yolo_busy = False
+                        LOG.warning("YOLO background thread unavailable: %s", exc)
+
+            # If there are no boxes, keep original frame and timing untouched.
+            if not yolo or not yolo.get("detections"):
+                return frame
 
             try:
-                out = img.copy()
-                if yolo and yolo.get("detections"):
-                    out = YOLOFireSmokeDetector.draw_boxes_on_frame(out, yolo)
-                status = ("NO MODEL" if self._detector is None or not self._detector.available
-                          else "DETECTED" if (yolo and yolo.get("detected")) else "CLEAR")
-                cv2.putText(
-                    out,
-                    f"CAM_01 [LIVE]  FPS {self._fps:.0f} | YOLO {status}",
-                    (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2,
-                )
+                # Drawing boxes is lightweight and only used when detection is active.
+                # Pass-through otherwise keeps the browser's video responsive.
+                img = sample if sample is not None else frame.to_ndarray(format="bgr24")
+                out = YOLOFireSmokeDetector.draw_boxes_on_frame(img, yolo)
                 new_frame = av.VideoFrame.from_ndarray(out, format="bgr24")
                 new_frame.pts = frame.pts
                 new_frame.time_base = frame.time_base
@@ -1217,17 +1247,36 @@ if WEBRTC_AVAILABLE:
                 return frame
 
         def snapshot(self):
-            """(latest_frame_copy, fresh_yolo_result, fps) for the Streamlit side."""
+            """Copy a recent sample and its YOLO result for Streamlit analysis."""
             with self._lock:
-                now = time.time()
+                now = time.monotonic()
                 if (
-                    self._latest_frame is None
+                    self._ended or self._latest_frame is None
+                    or now - self._last_sample_ts > CONFIG["WEBRTC_FRAME_MAX_AGE_SEC"]
                     or now - self._last_frame_ts > CONFIG["WEBRTC_FRAME_MAX_AGE_SEC"]
                 ):
                     return None, None, 0.0
-                fresh = now - self._yolo_result_ts < CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
-                yolo = self._yolo_result if fresh else None
-                return self._latest_frame.copy(), yolo, self._fps
+                fresh = now - self._yolo_result_ts <= CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
+                result = self._yolo_result if fresh else None
+                return self._latest_frame.copy(), result, self._fps
+
+        def health(self) -> Dict[str, Any]:
+            with self._lock:
+                return {
+                    "frames_received": self.frames_received,
+                    "age_sec": (time.monotonic() - self._last_frame_ts)
+                               if self._last_frame_ts else None,
+                    "ended": self._ended,
+                    "yolo_busy": self._yolo_busy,
+                }
+
+        def on_ended(self) -> None:
+            # Streamlit user state is inaccessible from WebRTC callback threads.
+            with self._lock:
+                self._ended = True
+                self._latest_frame = None
+                self._yolo_result = None
+
 else:
     BrowserCameraProcessor = None
 
@@ -1491,14 +1540,14 @@ def render_browser_camera_widget() -> None:
 
     with st.container(key="webrtc_transport"):
         ctx = webrtc_streamer(
-            key="cybervision-browser-camera",
+            key=f"cybervision-browser-camera-v3-{st.session_state.get('webrtc_connection_id', 0)}",
             mode=WebRtcMode.SENDRECV,
             desired_playing_state=True,
             rtc_configuration={"iceServers": ice_servers},
             media_stream_constraints={
                 "video": {
-                    "width": {"ideal": 480, "max": 640},
-                    "height": {"ideal": 360, "max": 480},
+                    "width": {"ideal": 480, "max": 480},
+                    "height": {"ideal": 360, "max": 360},
                     "frameRate": {"ideal": 12, "max": 15},
                 },
                 "audio": False,
@@ -1744,6 +1793,17 @@ def load_yolo_model():
         return None
 
     try:
+        # Torch otherwise tends to use every available CPU thread for YOLO,
+        # starving browser WebRTC frame processing on small hosted instances.
+        try:
+            import torch
+            torch.set_num_threads(int(CONFIG["YOLO_CPU_THREADS"]))
+            try:
+                torch.set_num_interop_threads(1)
+            except RuntimeError:
+                pass  # Inter-op threads can be configured only once.
+        except Exception as thread_exc:
+            LOG.debug("Optional torch CPU thread limit unavailable: %s", thread_exc)
         model = YOLO(model_path)
         state["error"] = ""
         return model
@@ -1830,8 +1890,8 @@ class YOLOFireSmokeDetector:
                         "box": [int(v) for v in xyxy],
                     })
 
-            annotated = self.draw_boxes_on_frame(frame, {"detections": detections}) if detections else frame
-
+            # Boxes are drawn only by the video renderer, not during inference.
+            # This saves an OpenCV copy/draw per inference.
             return {
                 "detected": bool(detections),
                 "detections": detections,
@@ -1840,7 +1900,7 @@ class YOLOFireSmokeDetector:
                     if detections else 0.0
                 ),
                 "classes": sorted(set(d["class"] for d in detections)),
-                "annotated_frame": annotated,
+                "annotated_frame": frame,
             }
 
         except Exception as exc:
@@ -2888,11 +2948,11 @@ def _connection_help_text() -> str:
             stage = f"frames arrived earlier ({frames} total) but stopped"
 
     return (
-        "Still no video from your browser. Where it stops: " + stage + ". "
-        "Check: (1) the page is opened over HTTPS and you clicked Allow on the camera prompt "
-        "(lock icon in the address bar if it never appeared); (2) no other app is using the camera. "
-        f"Relay: {tier}{' - ' + detail if detail else ''}. "
-        "If it still will not connect, reload the page and allow camera access again."
+        "Camera stream stalled: " + stage + ". "
+        f"Relay setup: {tier}{' - ' + detail if detail else ''}. "
+        "A TURN credential response does not guarantee that WebRTC media remains connected. "
+        "Press Reconnect Camera. If it persists, check Streamlit logs, network stability "
+        "and available CPU; then allow camera access again if prompted."
     )
 
 
@@ -2924,11 +2984,25 @@ def _live_webrtc_body() -> None:
             frame, yolo, fps = processor.snapshot()
 
         if frame is None:
+            st.session_state.fps = 0.0
             waited = time.time() - (st.session_state.get("camera_started_at") or time.time())
-            if waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
+            health = processor.health() if processor is not None else {}
+            last_age = health.get("age_sec")
+            stalled = bool(health.get("ended")) or (
+                last_age is not None and last_age >= CONFIG["WEBRTC_STALL_WARNING_SEC"]
+            )
+            if stalled or waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
                 status_slot.warning(_connection_help_text(), icon=":material/warning:")
+                if st.button("Reconnect Camera", key="reconnect_browser_camera", type="primary"):
+                    st.session_state.webrtc_connection_id += 1
+                    st.session_state.get("_cam_holder", {}).clear()
+                    st.session_state.webrtc_ctx = None
+                    st.session_state.camera_started_at = time.time()
+                    st.session_state.last_pipeline_ts = 0.0
+                    st.session_state.fps = 0.0
+                    st.rerun()
             else:
-                status_slot.info("Waiting for browser camera… click Allow on the camera prompt.")
+                status_slot.info("Connecting to browser camera…")
             return
 
         status_slot.empty()
