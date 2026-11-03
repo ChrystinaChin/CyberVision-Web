@@ -367,6 +367,7 @@ def init_session_state() -> None:
         "_last_snapshot_sig": None,
         "last_resolution": "",
         "frames_processed": 0,
+        "frames_received": 0,  # actual WebRTC callback frames, not analysis ticks
         "last_analyzed_frame": 0,
         "inference_count": 0,
         "alert_history": deque(maxlen=CONFIG["ALERT_HISTORY_MAX"]),
@@ -1164,6 +1165,8 @@ if WEBRTC_AVAILABLE:
             self._fps = 0.0
             self._last_tick = 0.0
             self._ended = False
+            self._last_decode_error_log = 0.0
+            self._last_render_error_log = 0.0
 
         def _yolo_worker(self, img: np.ndarray) -> None:
             try:
@@ -1180,7 +1183,8 @@ if WEBRTC_AVAILABLE:
 
         def recv(self, frame):
             now = time.monotonic()
-            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"]
+            # Apply adaptive sampling, not just YOLO throttling, when CPU/RAM is high.
+            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"] * (1, 2, 4)[ResourceGovernor.level()]
             with self._lock:
                 previous = self._last_tick
                 self._last_tick = now
@@ -1201,8 +1205,11 @@ if WEBRTC_AVAILABLE:
                 try:
                     # Decode to ndarray only 4 times/s, not for every WebRTC frame.
                     sample = frame.to_ndarray(format="bgr24")
-                except Exception:
+                except Exception as exc:
                     sample = None
+                    if now - self._last_decode_error_log >= 15.0:
+                        LOG.warning("WebRTC sample decode error: %s: %s", type(exc).__name__, exc)
+                        self._last_decode_error_log = now
 
             start_yolo = False
             if sample is not None:
@@ -1243,7 +1250,10 @@ if WEBRTC_AVAILABLE:
                 new_frame.pts = frame.pts
                 new_frame.time_base = frame.time_base
                 return new_frame
-            except Exception:
+            except Exception as exc:
+                if now - self._last_render_error_log >= 15.0:
+                    LOG.warning("WebRTC box overlay error: %s: %s", type(exc).__name__, exc)
+                    self._last_render_error_log = now
                 return frame
 
         def snapshot(self):
@@ -1276,6 +1286,7 @@ if WEBRTC_AVAILABLE:
                 self._ended = True
                 self._latest_frame = None
                 self._yolo_result = None
+            LOG.info("WebRTC track ended after %s received frames", self.frames_received)
 
 else:
     BrowserCameraProcessor = None
@@ -2769,36 +2780,47 @@ def render_dashboard_settings_panel() -> None:
         )
         CONFIG["INFERENCE_TIMEOUT"] = float(timeout_option.replace("s", ""))
 
-        st.markdown("<div style='height: 0.3rem;'></div>", unsafe_allow_html=True)
-        st.markdown("<div class='stats-panel-title'>Resources</div>", unsafe_allow_html=True)
+        render_resource_metrics_panel()
 
-        metrics = SystemMonitor.get_metrics()
-        cpu_class = _metric_status_class(metrics["cpu"])
-        ram_class = _metric_status_class(metrics["ram"])
-        cpu_delta = _metric_delta_icon(metrics["cpu"])
-        ram_delta = _metric_delta_icon(metrics["ram"])
 
-        m1, m2 = st.columns(2)
-        with m1:
-            with st.container(key=f"cpu_metric_{cpu_class}"):
-                st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
-        with m2:
-            with st.container(key=f"ram_metric_{ram_class}"):
-                st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
+def _render_resource_metrics_body() -> None:
+    st.markdown("<div style='height: 0.3rem;'></div>", unsafe_allow_html=True)
+    st.markdown("<div class='stats-panel-title'>Resources</div>", unsafe_allow_html=True)
 
-        if st.session_state.latency_history:
-            avg_latency = sum(st.session_state.latency_history) / len(st.session_state.latency_history)
-            st.metric("Avg Latency", f"{avg_latency * 1000:.0f} ms")
-        else:
-            st.metric("Avg Latency", "—")
+    metrics = SystemMonitor.get_metrics()
+    cpu_class = _metric_status_class(metrics["cpu"])
+    ram_class = _metric_status_class(metrics["ram"])
+    cpu_delta = _metric_delta_icon(metrics["cpu"])
+    ram_delta = _metric_delta_icon(metrics["ram"])
 
-        if st.session_state.last_error:
-            st.info("Model/YARA backend notice: Active fallback running.")
+    m1, m2 = st.columns(2)
+    with m1:
+        with st.container(key=f"cpu_metric_{cpu_class}"):
+            st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
+    with m2:
+        with st.container(key=f"ram_metric_{ram_class}"):
+            st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
 
-        if not is_yolo_model_available():
-            with st.expander(":material/error: YOLO not active — details", expanded=True):
-                for label, value in get_yolo_debug_info().items():
-                    st.text(f"{label}: {value}")
+    if st.session_state.latency_history:
+        avg_latency = sum(st.session_state.latency_history) / len(st.session_state.latency_history)
+        st.metric("Avg Latency", f"{avg_latency * 1000:.0f} ms")
+    else:
+        st.metric("Avg Latency", "—")
+
+    if st.session_state.last_error:
+        st.info("Model/YARA backend notice: Active fallback running.")
+
+    if not is_yolo_model_available():
+        with st.expander(":material/error: YOLO not active — details", expanded=True):
+            for label, value in get_yolo_debug_info().items():
+                st.text(f"{label}: {value}")
+
+
+def render_resource_metrics_panel() -> None:
+    # Fragments refresh metrics without remounting WebRTC or the setup controls.
+    refresh = 3.0 if st.session_state.get("camera_running", False) else None
+    st.fragment(_render_resource_metrics_body, run_every=refresh)()
+
 
 # DASHBOARD FUNCTIONS RESTORED AFTER SERVER SETUP REFACTOR
 def _browser_snapshot_mode() -> bool:
@@ -2857,7 +2879,10 @@ def _render_live_stats_body() -> None:
         r1c2.metric("Confidence", f"{confidence:.0f}%")
 
         r2c1, r2c2 = st.columns(2)
-        r2c1.metric("Frames", st.session_state.frames_processed)
+        frames = (st.session_state.get("frames_received", 0)
+                  if st.session_state.get("use_webrtc")
+                  else st.session_state.frames_processed)
+        r2c1.metric("Frames", int(frames))
         r2c2.metric("Hazards", hazards, f"of {total}")
 
 
@@ -2982,6 +3007,7 @@ def _live_webrtc_body() -> None:
         frame, yolo, fps = (None, None, 0.0)
         if processor is not None:
             frame, yolo, fps = processor.snapshot()
+            st.session_state.frames_received = int(processor.health().get("frames_received", 0))
 
         if frame is None:
             st.session_state.fps = 0.0
@@ -3183,6 +3209,7 @@ def render_video_feed() -> None:
             st.session_state.visual_prev_frame = None
             st.session_state.last_visual_result = None
             st.session_state.last_pipeline_ts = 0.0
+            st.session_state.frames_received = 0
             st.session_state.last_cloud_hazard_type = ""
             st.session_state.alarm_active = False
             st.session_state.active_hazard_toast = None
