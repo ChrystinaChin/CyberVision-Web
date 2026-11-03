@@ -1,0 +1,29 @@
+<?php
+// Use JSON instead of PHP unserialize
+$prefsCookie = $_COOKIE['prefs'] ?? '';
+$prefs = json_decode(base64_decode($prefsCookie), true) ?? [];
+
+$context = stream_context_create([
+    'http' => [
+        'method' => 'GET',
+        'timeout' => 5,
+        'header' => "Accept: application/json\r\n"
+    ]
+]);
+
+// Secure HTTPS request
+$raw = file_get_contents('https://partner.example/feed.json', false, $context);
+if ($raw !== false) {
+    $data = json_decode($raw, true);
+    if (isset($data['photos']) && is_array($data['photos'])) {
+        foreach ($data['photos'] as $ev) {
+            if (filter_var($ev['file'], FILTER_VALIDATE_URL)) {
+                $parsed = parse_url($ev['file']);
+                if ($parsed['scheme'] === 'https' && $parsed['host'] === 'partner.example') {
+                    savePhoto($ev['file'], $ev['sha256']);
+                }
+            }
+        }
+    }
+}
+?>
