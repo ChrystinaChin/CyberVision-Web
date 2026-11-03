@@ -401,6 +401,10 @@ def init_session_state() -> None:
         if key not in st.session_state:
             st.session_state[key] = value
 
+    # Browser-mode selector was removed. Clear a stored Snapshot choice from
+    # earlier deployments before render_video_feed() runs on this rerun.
+    st.session_state.browser_cam_mode = BROWSER_MODE_LIVE
+
     if "use_webrtc" not in st.session_state:
         needs_browser_camera = is_cloud_environment() or not local_camera_available()
         st.session_state.use_webrtc = needs_browser_camera and WEBRTC_AVAILABLE
@@ -1113,7 +1117,9 @@ class ResourceGovernor:
 
     @staticmethod
     def yolo_image_size() -> int:
-        return (CONFIG["YOLO_IMAGE_SIZE"], 448, 384)[ResourceGovernor.level()]
+        # Each throttle level must use fewer pixels, not more.
+        # Ultralytics rounds to a suitable stride internally.
+        return (CONFIG["YOLO_IMAGE_SIZE"], 352, 320)[ResourceGovernor.level()]
 
     @staticmethod
     def recommended_token_budget() -> int:
@@ -2733,6 +2739,68 @@ def render_dashboard_settings_panel() -> None:
             with st.expander(":material/error: YOLO not active — details", expanded=True):
                 for label, value in get_yolo_debug_info().items():
                     st.text(f"{label}: {value}")
+
+# DASHBOARD FUNCTIONS RESTORED AFTER SERVER SETUP REFACTOR
+def _browser_snapshot_mode() -> bool:
+    return bool(
+        st.session_state.get("use_webrtc")
+        and st.session_state.get("browser_cam_mode") == BROWSER_MODE_SNAPSHOT
+    )
+
+
+def render_dashboard_header() -> None:
+    cam_running = st.session_state.camera_running or _browser_snapshot_mode()
+    yolo_ready = is_yolo_model_available()
+
+    if cam_running and yolo_ready:
+        pill_text, pill_color = "YOLO ACTIVE", "#16a34a"
+    elif cam_running:
+        pill_text, pill_color = "FALLBACK MODE", "#ca8a04"
+    else:
+        pill_text, pill_color = "STANDBY", "#6b7280"
+
+    st.markdown(
+        f"""
+        <div class="dash-header">
+            <div>
+                <div class="dash-header-title">Live Camera Feeds</div>
+                <div class="dash-header-subtitle">Real-time AI fire &amp; smoke detection and alerting.</div>
+            </div>
+            <div class="status-pill-live" style="background:{pill_color}1f; color:{pill_color};">
+                <span class="status-pill-dot" style="background:{pill_color};"></span>
+                {pill_text}
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _render_live_stats_body() -> None:
+    latest = st.session_state.get("latest_detection") or {}
+
+    severity = str(st.session_state.get("yolo_severity", "NORMAL")).upper()
+    if severity not in SEVERITY_STYLE:
+        severity = "NORMAL"
+
+    total = len(st.session_state.alert_history)
+    hazards = sum(1 for item in st.session_state.alert_history if item["is_hazard"])
+    confidence = (latest.get("confidence", 0) * 100 if latest else 0)
+
+    with st.container():
+        st.markdown("<div class='stats-panel-title'>Active Monitoring</div>", unsafe_allow_html=True)
+
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            with st.container(key=f"severity_metric_{severity.lower()}"):
+                st.metric("Severity", severity)
+        r1c2.metric("Confidence", f"{confidence:.0f}%")
+
+        r2c1, r2c2 = st.columns(2)
+        r2c1.metric("Frames", st.session_state.frames_processed)
+        r2c2.metric("Hazards", hazards, f"of {total}")
+
+
 
 def render_live_stats_panel() -> None:
     refresh = 1.0 if st.session_state.get("camera_running") else None
