@@ -327,7 +327,7 @@ def sync_cloud_once() -> None:
             return
         gcs_client, db_client = get_cloud_runtime_clients()
         if gcs_client is None or db_client is None:
-            _update_cloud_status(False, "Cloud clients not ready. Check SDK, service account and project in Server Setup.")
+            _update_cloud_status(False, "Cloud clients not ready; check google-cloud-firestore install and [gcp_service_account] in Streamlit secrets.")
             return
         # Event database is separate from GCS image backups: retry either independently.
         with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
@@ -373,16 +373,20 @@ def _start_sync_thread_once() -> bool:
 
 
 def start_sync_thread() -> None:
-    # Resolve Streamlit secrets and SDK clients only on the script thread.
+    """Initialize cloud clients on Streamlit's script thread, then retry in background."""
     configure_cloud_from_secrets()
     gcs, db = get_gcp_clients() if GCP_AVAILABLE else (None, None)
     with CLOUD_CLIENTS_LOCK:
         CLOUD_CLIENTS.update(storage=gcs, firestore=db)
-    # Previously a hidden "local backup only" toggle was the sole control.
-    # Synchronization is now automatic when cloud clients are usable.
-    st.session_state.cloud_sync_enabled = bool(gcs is not None and db is not None)
+    # The old toggle was removed. Every confirmed hazard is queued regardless
+    # of whether authentication or the network is currently available.
+    st.session_state.cloud_sync_enabled = True
     if not GCP_AVAILABLE:
-        _update_cloud_status(False, "Install google-cloud-firestore, google-cloud-storage, google-auth.")
+        _update_cloud_status(False,
+            "Google Cloud SDK incomplete: install google-cloud-firestore, "
+            "google-cloud-storage and google-auth.")
+    elif gcs is None or db is None:
+        LOG.warning("Cloud backup pending: %s", CLOUD_STATUS.get("last_error", "clients unavailable"))
     _start_sync_thread_once()
 
 
@@ -410,7 +414,9 @@ def init_session_state() -> None:
         "vlm_context": "READY",
         "last_error": "",
         "last_public_notice": "",
-        "cloud_sync_enabled": bool(GCP_AVAILABLE and _get_gcp_service_account_info()),
+        # Automatic cloud-first event buffering, independent of connection state.
+        # Missing/expired credentials should not silently discard hazard backups.
+        "cloud_sync_enabled": True,
         "fps": 0.0,
         "last_frame_time": time.time(),
         "camera_started_at": 0.0,
@@ -1424,14 +1430,22 @@ def _get_metered_credentials() -> Tuple[Optional[str], Optional[str]]:
 # GOOGLE CLOUD CREDENTIALS
 # =============================================================================
 def _get_gcp_service_account_info() -> Optional[dict]:
+    """Read a *service account*, not the Google OAuth login client in [auth.google].
+
+    Supports GCP_SERVICE_ACCOUNT_JSON (JSON string or TOML inline table),
+    [gcp_service_account], [GCP_SERVICE_ACCOUNT], [service_account], and
+    common alternative names. Do not log or display service-account keys.
+    """
     raw = _get_secret("GCP_SERVICE_ACCOUNT_JSON")
     if raw:
         try:
-            info = json.loads(raw) if isinstance(raw, str) else dict(raw)
-            if isinstance(info, dict):
-                return _normalize_service_account(info)
-        except (ValueError, TypeError):
-            pass
+            value = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if isinstance(value, dict):
+                return _normalize_service_account(value)
+        except (ValueError, TypeError) as exc:
+            _update_cloud_status(False,
+                f"GCP_SERVICE_ACCOUNT_JSON is not valid JSON/table: {type(exc).__name__}")
+            return None
     try:
         for key in ("gcp_service_account", "GCP_SERVICE_ACCOUNT", "service_account",
                     "google_service_account", "google_cloud_service_account", "gcp"):
@@ -1440,19 +1454,23 @@ def _get_gcp_service_account_info() -> Optional[dict]:
                 if isinstance(info, str):
                     info = json.loads(info)
                 return _normalize_service_account(dict(info))
-        # Flat TOML service account fields are also supported.
+        # Flat service account TOML fields are supported too.
         if "private_key" in st.secrets and "client_email" in st.secrets:
             return _normalize_service_account(dict(st.secrets))
     except Exception as exc:
-        LOG.warning("Cannot parse GCP secret structure: %s", type(exc).__name__)
+        _update_cloud_status(False,
+            f"Cannot parse GCP service account section: {type(exc).__name__}")
+        return None
 
+    # Optional local-dev fallback; never commit the JSON file to a public repo.
     local_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "service_account.json")
     if os.path.isfile(local_key_path):
         try:
             with open(local_key_path, encoding="utf-8") as keyfile:
                 return _normalize_service_account(json.load(keyfile))
         except Exception as exc:
-            LOG.warning("Could not load service_account.json: %s", type(exc).__name__)
+            _update_cloud_status(False,
+                f"Cannot read local service account file: {type(exc).__name__}")
     return None
 
 
@@ -1464,33 +1482,85 @@ def _normalize_service_account(info: dict) -> dict:
     return result
 
 
-@st.cache_resource(show_spinner=False)
 def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
+    """Construct clients using service account secrets or deployed ADC.
+
+    Do not cache failed initialization: installing a missing secret followed by
+    a deployment restart must allow a clean retry. Background threads use
+    get_cloud_runtime_clients() rather than consulting Streamlit secrets.
+    """
     if not GCP_AVAILABLE:
+        _update_cloud_status(False,
+            "Missing cloud SDK. Add google-cloud-firestore, google-cloud-storage, google-auth to requirements.txt")
         return None, None
+    # Reuse clients across Streamlit reruns; cloud threads use the same clients.
+    cached_storage, cached_firestore = get_cloud_runtime_clients()
+    if cached_storage is not None and cached_firestore is not None:
+        return cached_storage, cached_firestore
+    info = None
     try:
         info = _get_gcp_service_account_info()
-        if not info:
-            _update_cloud_status(False, "No service account found in Streamlit secrets.")
-            return None, None
-        credentials = gcp_service_account.Credentials.from_service_account_info(info)
-        # Honor deployment secrets rather than a hardcoded localhost project.
-        project = info.get("project_id") or _get_secret("GCP_PROJECT_ID") or CONFIG["GCP_PROJECT_ID"]
-        return (storage.Client(credentials=credentials, project=project),
-                firestore.Client(credentials=credentials, project=project))
+        project = None
+        credentials = None
+        if info is not None:
+            required = ("client_email", "private_key", "token_uri")
+            missing = [key for key in required if not info.get(key)]
+            if missing:
+                raise ValueError("GCP service account is missing: " + ", ".join(missing))
+            credentials = gcp_service_account.Credentials.from_service_account_info(info)
+            project = info.get("project_id") or _get_secret("GCP_PROJECT_ID")
+        else:
+            # Application Default Credentials are only expected on Google Cloud
+            # deployments or when an explicit credential path was configured.
+            # Avoid an unnecessary metadata-server lookup on Streamlit Cloud.
+            adc_configured = bool(os.environ.get("GOOGLE_APPLICATION_CREDENTIALS")
+                                  or os.environ.get("K_SERVICE")
+                                  or os.environ.get("GAE_ENV"))
+            if not adc_configured:
+                raise RuntimeError(
+                    "No GCP service account configured. Google login [auth.google] "
+                    "does not grant Cloud Storage/Firestore access; add [gcp_service_account] "
+                    "to Streamlit Secrets.")
+            import google.auth
+            credentials, detected_project = google.auth.default(
+                scopes=["https://www.googleapis.com/auth/cloud-platform"])
+            project = _get_secret("GCP_PROJECT_ID") or detected_project
+
+        if not project:
+            raise ValueError("GCP_PROJECT_ID or service-account project_id is required")
+        # No hardcoded placeholder project ID: the credential's project is authoritative.
+        clients = (storage.Client(credentials=credentials, project=project),
+                   firestore.Client(credentials=credentials, project=project))
+        return clients
     except Exception as exc:
-        _update_cloud_status(False, f"GCP credentials/client: {type(exc).__name__}: {exc}")
+        # Do not include private-key values or the entire credentials object.
+        reason = f"GCP credential/client initialization failed: {type(exc).__name__}: {exc}"
+        _update_cloud_status(False, reason)
         return None, None
 
 
 def get_cloud_bucket_name() -> str:
-    # CONFIG is initialized on the main Streamlit thread before background sync.
+    """Called by worker; bucket name resolved from secrets on script thread."""
     return str(CONFIG["GCP_BUCKET"]).strip()
 
 
 def configure_cloud_from_secrets() -> None:
-    """Read Streamlit secrets only on the main script thread."""
+    """Load cloud settings only on Streamlit's script thread.
+
+    Bucket may be at TOML root or alongside credentials in [gcp_service_account],
+    so users can append a complete table after their existing [auth.google].
+    """
     bucket = _get_secret("GCP_BUCKET") or _get_secret("GCS_BUCKET")
+    if not bucket:
+        try:
+            for table_name in ("gcp_service_account", "GCP_SERVICE_ACCOUNT", "gcp"):
+                table = st.secrets.get(table_name)
+                if table:
+                    bucket = table.get("bucket") or table.get("gcp_bucket")
+                    if bucket:
+                        break
+        except Exception:
+            pass
     if bucket:
         CONFIG["GCP_BUCKET"] = str(bucket).strip()
 
@@ -2417,22 +2487,25 @@ def flush_pending_cloud_uploads(client=None) -> None:
 
 def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any],
                                  cloud_sync_enabled: bool) -> None:
+    """Durably queue a confirmed hazard; retry even after temporary auth failures."""
     event_uuid = uuid.uuid4().hex
     event = {**alert, "event_id": event_uuid, "camera_id": "CAM_01"}
-    # Always save local event. When cloud is off it must not later sync on its own.
     try:
         save_event_locally(time.time(), event.get("severity", "UNKNOWN"),
                            event.get("description", ""), event_uuid=event_uuid,
-                           cloud_enabled=cloud_sync_enabled)
+                           cloud_enabled=True)
     except Exception as exc:
         _update_cloud_status(False, f"SQLite event queue: {type(exc).__name__}: {exc}")
-    if not cloud_sync_enabled:
-        _update_cloud_status(False, "Cloud upload is disabled: credentials or Google Cloud SDK not ready.")
-        return
+    # Queue image *even when credentials are not configured yet*. Previously
+    # "cloud_sync_enabled=False" lost the image and marked the event synced.
     if not _queue_image_for_later_upload(frame, event):
         return
-    # The global lock keeps an upload burst from creating concurrent flushes.
-    threading.Thread(target=sync_cloud_once, daemon=True, name="cybervision-upload").start()
+    gcs, db = get_cloud_runtime_clients()
+    if gcs is None or db is None:
+        LOG.warning("Cloud client not ready; event %s held in local retry queue", event_uuid)
+        return
+    threading.Thread(target=sync_cloud_once, daemon=True,
+                     name="cybervision-upload").start()
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -2838,64 +2911,8 @@ def render_dashboard_settings_panel() -> None:
             value=st.session_state.sound_enabled,
         )
 
-        # Cloud backup was previously hidden behind a disabled toggle, making
-        # failures impossible to diagnose. Keep it automatic and show status.
-        cloud_ready = bool(st.session_state.get("cloud_sync_enabled"))
-        with CLOUD_STATUS_LOCK:
-            cloud_status = dict(CLOUD_STATUS)
-        event_count, image_count = pending_cloud_counts()
-        if cloud_ready:
-            st.caption(f"Cloud backup: configured · queued {event_count} event(s), {image_count} image(s)")
-        else:
-            st.warning("Cloud backup: not connected. Open diagnostics below to test configuration.")
-        if cloud_status.get("last_error"):
-            st.warning("Cloud sync: " + cloud_status["last_error"])
-
-        with st.expander("Cloud backup diagnostics", expanded=not cloud_ready):
-            if not GCP_AVAILABLE:
-                st.error("Google Cloud SDK packages are missing from the deployment.")
-            elif not _get_gcp_service_account_info():
-                st.error("Service account not found. Check the Streamlit Cloud Secrets TOML.")
-            else:
-                st.caption("Service account found. Actual write permissions require testing.")
-            st.caption(f"Storage bucket: `{get_cloud_bucket_name()}`")
-            st.caption(f"Pending: {event_count} Firestore event(s), {image_count} Storage image(s)")
-            if cloud_status.get("firestore_success"):
-                st.caption("Firestore: " + cloud_status["firestore_success"])
-            if cloud_status.get("storage_success"):
-                st.caption("Storage: " + cloud_status["storage_success"])
-            if st.button("Test Google Cloud", key="test_gcp_button"):
-                gcs_client, db_client = get_cloud_runtime_clients()
-                if gcs_client is None or db_client is None:
-                    st.error("Cloud clients unavailable. Check deployment packages and service account.")
-                else:
-                    marker_id = "test_" + uuid.uuid4().hex
-                    bucket = gcs_client.bucket(get_cloud_bucket_name())
-                    blob = bucket.blob("cybervision_diagnostics/" + marker_id + ".json")
-                    doc = db_client.collection("cybervision_diagnostics").document(marker_id)
-                    try:
-                        blob.upload_from_string('{"test":true}', content_type="application/json", timeout=20)
-                        _update_cloud_status(True, "Storage diagnostic write succeeded", service="storage")
-                        st.success("Storage write succeeded")
-                    except Exception as exc:
-                        _update_cloud_status(False, f"Storage test: {type(exc).__name__}: {exc}", service="storage")
-                        st.error(f"Storage write FAILED: {type(exc).__name__}: {exc}")
-                    try:
-                        doc.set({"test": True, "timestamp": firestore.SERVER_TIMESTAMP}, timeout=20)
-                        _update_cloud_status(True, "Firestore diagnostic write succeeded", service="firestore")
-                        st.success("Firestore write succeeded")
-                    except Exception as exc:
-                        _update_cloud_status(False, f"Firestore test: {type(exc).__name__}: {exc}", service="firestore")
-                        st.error(f"Firestore write FAILED: {type(exc).__name__}: {exc}")
-                    # Cleanup is optional: object creator roles may not allow delete.
-                    try:
-                        blob.delete(timeout=10)
-                        doc.delete()
-                    except Exception:
-                        pass
-            if st.button("Retry queued uploads", key="cloud_retry_button"):
-                threading.Thread(target=sync_cloud_once, daemon=True, name="cybervision-retry").start()
-                st.info("Sync requested; refresh the page to see updated status.")
+        # Cloud backup is automatic and configured in Streamlit secrets. Keep
+        # diagnostics in server logs, not the Server Setup UI.
 
         timeout_option = st.selectbox(
             "Inference timeout target",
