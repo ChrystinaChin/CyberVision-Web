@@ -179,14 +179,15 @@ CONFIG: Dict[str, Any] = {
     "VLM_MODEL": "moondream",
     "CAMERA_INDEX": 0,
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
-    "WEBRTC_ANALYSIS_WIDTH": 320,       # browser-camera frames are analysed at this width
-    "WEBRTC_TICK_SEC": 0.75,            # alert/stat tick in browser-camera mode (draws no images)
-    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 1.25,  # YOLO stays off the real-time video path
-    "WEBRTC_SAMPLE_INTERVAL_SEC": 0.25,  # maximum 4 sampled analysis frames / second
+    "WEBRTC_ANALYSIS_WIDTH": 320,       # limit browser-side OpenCV analysis resolution
+    "WEBRTC_TICK_SEC": 1.0,             # analysis/status tick; browser video is independent
+    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 1.75,  # scheduled CPU inference stays off real-time video path
+    "WEBRTC_SAMPLE_INTERVAL_SEC": 0.4,   # analysis only: maximum 2.5 samples/s, stream still sends every frame
     "WEBRTC_STALL_WARNING_SEC": 6.0,  # show a reconnect action once frames stop
-    "YOLO_CPU_THREADS": 2,  # leave CPU capacity for WebRTC video encoding
+    "YOLO_CPU_THREADS": 1,  # preserve CPU capacity for WebRTC encoding and UI
     "WEBRTC_YOLO_RESULT_TTL_SEC": 3.0,  # boxes older than this are dropped
-    "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,    # a frame older than this counts as "no signal"
+    "WEBRTC_FRAME_MAX_AGE_SEC": 5.0,    # tolerate adaptive sampling under CPU pressure
+    "LOCAL_PIPELINE_INTERVAL_SEC": 0.65,  # keep local camera redraws independent of AI inference
     "SNAPSHOT_ANALYSIS_WIDTH": 640,
     "CAMERA_CONNECT_HINT_SEC": 15,
     "BUSY_FLAG_TIMEOUT_SEC": 8.0,
@@ -217,7 +218,7 @@ CONFIG: Dict[str, Any] = {
     "YOLO_SMOKE_CONFIDENCE": 0.25,
     "YOLO_IMAGE_SIZE": 416,  # 160 px removed too much detail for diffuse smoke
     "YOLO_EVERY_N_FRAMES": 8,
-    "VISUAL_DETECT_EVERY_N_FRAMES": 4,
+    "VISUAL_DETECT_EVERY_N_FRAMES": 1,  # preserve timely smoke fallback between YOLO runs
 }
 
 SEVERITY_STYLE = {
@@ -434,6 +435,8 @@ def init_session_state() -> None:
         "last_cloud_upload_ts": 0.0,
         "last_cloud_hazard_type": "",
         "last_pipeline_ts": 0.0,
+        "last_local_pipeline_ts": 0.0,
+        "last_local_yolo_result": None,
         "visual_smoke_streak": 0,
         "visual_fire_streak": 0,
         "visual_prev_frame": None,
@@ -1170,11 +1173,11 @@ class ResourceGovernor:
 
     @staticmethod
     def yolo_interval() -> float:
-        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 2.5, 4.0)[ResourceGovernor.level()]
+        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 3.0, 5.0)[ResourceGovernor.level()]
 
     @staticmethod
     def pipeline_interval() -> float:
-        return (0.75, 1.50, 2.5)[ResourceGovernor.level()]
+        return (1.0, 1.7, 2.7)[ResourceGovernor.level()]
 
     @staticmethod
     def yolo_image_size() -> int:
@@ -1189,35 +1192,41 @@ class ResourceGovernor:
 def draw_browser_camera_hud(frame_bgr: np.ndarray, fps: float, yolo_detected: bool,
                             inference_count: int, severity: str,
                             throttle_level: int) -> np.ndarray:
-    """Draw the live HUD in WebRTC frames. Never uses Streamlit session state.
+    """Compact, directly-on-video HUD matching the original 3×3 camera tile.
 
-    Small ROI-only alpha blend + 3 lines of text; safe for 480x360 browser
-    video. Unlike an HTML overlay, this is displayed inside the returned feed.
+    CAM_01 [LIVE]
+    FPS: <fps> | YOLO: CLEAR/DETECTED
+    INF: <count> | STATUS: <severity>
+
+    The adaptive governor stays operational, but is no longer printed over
+    the footage. No translucent rectangle is created per frame.
     """
-    height, width = frame_bgr.shape[:2]
-    panel_w, panel_h = min(width - 4, 310), min(height - 4, 78)
-    if panel_w <= 0 or panel_h <= 0:
+    if frame_bgr is None or frame_bgr.size == 0:
         return frame_bgr
-    x0, y0 = 3, 3
-    roi = frame_bgr[y0:y0 + panel_h, x0:x0 + panel_w]
-    dim = np.zeros_like(roi)
-    cv2.addWeighted(dim, 0.60, roi, 0.40, 0, dst=roi)
-    cv2.rectangle(frame_bgr, (x0, y0), (x0 + panel_w - 1, y0 + panel_h - 1), (255, 220, 0), 1)
-    cv2.line(frame_bgr, (x0 + 2, y0 + panel_h - 3),
-             (x0 + panel_w - 3, y0 + panel_h - 3), (255, 230, 0), 1)
-
-    severity = str(severity).upper() if severity else "NORMAL"
-    sev_color = ((0, 0, 255) if severity == "CRITICAL" else
-                 (0, 175, 255) if severity == "HIGH" else
-                 (0, 255, 255) if severity == "MEDIUM" else (0, 255, 0))
-    cv2.putText(frame_bgr, f"FPS: {fps:.1f} | YOLO: {'DETECTED' if yolo_detected else 'CLEAR'}",
-                (10, 21), cv2.FONT_HERSHEY_SIMPLEX, .43, (0, 255, 0), 1, cv2.LINE_AA)
-    cv2.putText(frame_bgr, f"INF: {inference_count} | STATUS: {severity}",
-                (10, 42), cv2.FONT_HERSHEY_SIMPLEX, .43, sev_color, 1, cv2.LINE_AA)
-    throttle_name = ('NORMAL', 'MEDIUM', 'CRITICAL')[max(0, min(2, int(throttle_level)))]
-    throttle_color = ((0, 255, 0), (0, 255, 255), (0, 0, 255))[max(0, min(2, int(throttle_level)))]
-    cv2.putText(frame_bgr, f"THROTTLE: L{throttle_level} ({throttle_name})",
-                (10, 63), cv2.FONT_HERSHEY_SIMPLEX, .40, throttle_color, 1, cv2.LINE_AA)
+    h, w = frame_bgr.shape[:2]
+    severity = str(severity or "NORMAL").upper()
+    if severity not in SEVERITY_STYLE:
+        severity = "NORMAL"
+    color = (0, 0, 255) if severity == "CRITICAL" else (
+        (0, 140, 255) if severity == "HIGH" else
+        (0, 230, 255) if severity == "MEDIUM" else (0, 255, 0)
+    )
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    lines = (
+        ("CAM_01 [LIVE]", (0, 190, 0)),
+        (f"FPS: {fps:.1f} | YOLO: {'DETECTED' if yolo_detected else 'CLEAR'}", (0, 255, 0)),
+        (f"INF: {inference_count} | STATUS: {severity}", color),
+    )
+    for row, (message, text_color) in enumerate(lines):
+        x, y = 9, 19 + row * 22
+        if y >= h:
+            break
+        # Thin camera title, then bold green monitoring values, as in reference.
+        font_scale = (0.42 if row == 0 else 0.50) if w >= 320 else 0.36
+        thickness = 1 if row == 0 else 2
+        # Black text stroke (not a filled panel) improves readability over fire.
+        cv2.putText(frame_bgr, message, (x, y), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_8)
+        cv2.putText(frame_bgr, message, (x, y), font, font_scale, text_color, thickness, cv2.LINE_8)
     return frame_bgr
 
 
@@ -1226,12 +1235,11 @@ def draw_browser_camera_hud(frame_bgr: np.ndarray, fps: float, yolo_detected: bo
 # =============================================================================
 if WEBRTC_AVAILABLE:
     class BrowserCameraProcessor(VideoProcessorBase):
-        """Keep WebRTC transmission independent of expensive AI inference.
+        """Keep AI inference off the real-time video callback.
 
-        recv() is called for every video frame, but converts pixels only for an
-        occasional detection sample, and hands that sample to a bounded worker.
-        Frames without detection boxes are returned unmodified. This avoids
-        constant PyAV frame creation, OpenCV work and extra CPU/memory pressure.
+        The browser sends a small 320x240 stream; each received frame gets only
+        the compact HUD and optional cached YOLO boxes. An occasional sampled
+        frame goes to the asynchronous detector, never blocking recv().
         No Streamlit calls occur on the WebRTC worker threads.
         """
 
@@ -1300,7 +1308,7 @@ if WEBRTC_AVAILABLE:
             sample = None
             if needs_sample:
                 try:
-                    # Decode to ndarray only 4 times/s, not for every WebRTC frame.
+                    # Copy a detection/analysis sample no more than 2.5 times/s at L0.
                     sample = frame.to_ndarray(format="bgr24")
                 except Exception as exc:
                     sample = None
@@ -1334,15 +1342,18 @@ if WEBRTC_AVAILABLE:
                             self._yolo_busy = False
                         LOG.warning("YOLO background thread unavailable: %s", exc)
 
-            # Always render the status HUD, including between YOLO detections.
-            # This is a lightweight 480x360 frame conversion; YOLO itself remains
-            # on the bounded background worker and the WebRTC frame is still sent
-            # if a render error occurs.
+            # Always render the compact three-line HUD, including between YOLO
+            # detections. 320x240 greatly reduces the per-frame encode cost;
+            # a rendering error still passes through the original frame.
             try:
-                img = sample if sample is not None else frame.to_ndarray(format="bgr24")
-                out = img.copy()  # sampled image also belongs to asynchronous YOLO
+                # Decoding is required for a HUD embedded in a SENDRECV video.
+                # The smaller capture avoids repeated 480x360 frame transformations.
+                # On sampled frames, the async model may still be reading sample;
+                # copy once to keep the model input immutable.
+                out = sample.copy() if sample is not None else frame.to_ndarray(format="bgr24")
                 if yolo and yolo.get("detections"):
-                    out = YOLOFireSmokeDetector.draw_boxes_on_frame(out, yolo)
+                    # Draw directly to the output array instead of making another copy.
+                    YOLOFireSmokeDetector.draw_boxes_in_place(out, yolo)
                 out = draw_browser_camera_hud(
                     out, self._fps, bool(yolo and yolo.get("detected")),
                     inference_count, hud_severity, ResourceGovernor.level()
@@ -1725,9 +1736,9 @@ def render_browser_camera_widget() -> None:
             rtc_configuration={"iceServers": ice_servers},
             media_stream_constraints={
                 "video": {
-                    "width": {"ideal": 480, "max": 480},
-                    "height": {"ideal": 360, "max": 360},
-                    "frameRate": {"ideal": 12, "max": 15},
+                    "width": {"ideal": 320, "max": 320},
+                    "height": {"ideal": 240, "max": 240},
+                    "frameRate": {"ideal": 12, "max": 12},
                 },
                 "audio": False,
             },
@@ -1836,8 +1847,9 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
         cam_key = f"CAM_{idx+1:02d}"
         if idx in active_frames and active_frames[idx] is not None:
             tile = cv2.resize(active_frames[idx], (tile_w, tile_h))
-            cv2.putText(tile, f"{cam_key} [LIVE]", (10, 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            if idx != 0:  # primary tile's camera title is drawn with the live HUD
+                cv2.putText(tile, f"{cam_key} [LIVE]", (10, 20),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
             cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (0, 255, 0), 1)
         else:
             tile = get_cached_blank_tile(tile_w, tile_h, f"{cam_key}: NO CAMERA DETECTED")
@@ -2119,8 +2131,13 @@ class YOLOFireSmokeDetector:
     def draw_boxes_on_frame(frame: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
         if not yolo_result or not yolo_result.get("detections"):
             return frame
+        return YOLOFireSmokeDetector.draw_boxes_in_place(frame.copy(), yolo_result)
 
-        annotated = frame.copy()
+    @staticmethod
+    def draw_boxes_in_place(annotated: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
+        """Fast renderer for writable frames that are not shared with the YOLO worker."""
+        if not yolo_result or not yolo_result.get("detections"):
+            return annotated
         for det in yolo_result["detections"]:
             x1, y1, x2, y2 = det["box"]
             label = f"{det['class']} {det['confidence']:.0%}"
@@ -3254,26 +3271,32 @@ def _live_local_camera_body() -> None:
         st.session_state.last_frame_time = current_time
         st.session_state.frames_processed += 1
 
-        pipeline_result = run_detection_pipeline(primary_frame)
-        yolo_result = pipeline_result.get("yolo", {})
+        # Camera refresh must not wait for expensive AI/visual analysis on
+        # every Streamlit fragment rerun; schedule the pipeline independently.
+        last_pipeline = st.session_state.get("last_local_pipeline_ts", 0.0)
+        pressure = ResourceGovernor.level()
+        analysis_interval = CONFIG["LOCAL_PIPELINE_INTERVAL_SEC"] * (1, 1.6, 3.0)[pressure]
+        if current_time - last_pipeline >= analysis_interval:
+            st.session_state.last_local_pipeline_ts = current_time
+            pipeline_result = run_detection_pipeline(primary_frame)
+            yolo_result = pipeline_result.get("yolo", {})
+            st.session_state.last_local_yolo_result = yolo_result
+        else:
+            yolo_result = st.session_state.get("last_local_yolo_result") or dict(EMPTY_YOLO_RESULT)
+            # Drain completed YOLO worker results without invoking analysis.
+            YOLOFireSmokeDetector.drain_worker_queue()
+            if st.session_state.get("yolo_detection") is not None:
+                yolo_result = st.session_state.yolo_detection
+                st.session_state.last_local_yolo_result = yolo_result
 
         if 0 in active_frames and primary_frame is not None:
             active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(primary_frame, yolo_result)
 
         display = construct_3x3_grid(active_frames)
-
-        severity = st.session_state.get("yolo_severity", "NORMAL")
-        yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
-
-        hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
-        hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
-
-        overlay = display.copy()
-        cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
-        cv2.addWeighted(overlay, 0.50, display, 0.50, 0, display)
-
-        cv2.putText(display, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
-        cv2.putText(display, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+        # Write the HUD directly inside the primary 320×240 camera tile.
+        draw_browser_camera_hud(display[:240, :320], fps, bool(yolo_result.get("detected")),
+                                int(st.session_state.get("inference_count", 0)),
+                                st.session_state.get("yolo_severity", "NORMAL"), pressure)
 
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = display_rgb
@@ -3360,6 +3383,8 @@ def render_video_feed() -> None:
             st.session_state.visual_prev_frame = None
             st.session_state.last_visual_result = None
             st.session_state.last_pipeline_ts = 0.0
+            st.session_state.last_local_pipeline_ts = 0.0
+            st.session_state.last_local_yolo_result = None
             st.session_state.frames_received = 0
             st.session_state.last_cloud_hazard_type = ""
             st.session_state.alarm_active = False
