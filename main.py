@@ -1139,32 +1139,51 @@ class ResourceGovernor:
         ResourceGovernor.update_from_metrics(SystemMonitor.get_metrics())
 
     @staticmethod
-    def update_from_metrics(metrics: Dict[str, Any]) -> int:
-        """Update the shared governor for both WebRTC workers and script fragments.
+    def _publish_pressure(cpu: float, ram: float, sampled_at: float) -> int:
+        """Publish one consistent level for the UI, localhost and WebRTC threads."""
+        # CPU >= 90 or RAM >= 90 is CRITICAL; >=75 CPU / >=80 RAM is MEDIUM.
+        level = 2 if cpu >= 90 or ram >= 90 else 1 if cpu >= 75 or ram >= 80 else 0
+        with RESOURCE_LOAD_LOCK:
+            RESOURCE_LOAD.update(level=level, cpu=cpu, ram=ram, updated_at=sampled_at)
+        return level
 
-        CPU >75% or RAM >80% -> medium; CPU >90% or RAM >90% ->
-        critical. Lower values switch to normal. The governor changes actual
-        frame sampling, YOLO size/interval and detection pipeline frequency.
-        """
+    @staticmethod
+    def update_from_metrics(metrics: Dict[str, Any]) -> int:
+        """Apply the CPU/RAM readings shown in the dashboard to the governor."""
         cpu = float(metrics.get("cpu", 0.0))
         ram = float(metrics.get("ram", 0.0))
-        if cpu >= 90 or ram >= 90:
-            level = 2
-        elif cpu >= 75 or ram >= 80:
-            level = 1
-        else:
-            level = 0
-        with RESOURCE_LOAD_LOCK:
-            RESOURCE_LOAD.update(level=level, cpu=cpu, ram=ram, updated_at=time.monotonic())
+        level = ResourceGovernor._publish_pressure(cpu, ram, time.monotonic())
         st.session_state.resource_throttle_level = level
         st.session_state.system_status = "RESOURCE_PRESSURE" if level else "HEALTHY"
         st.session_state.vlm_context = "REDUCED" if level else "ACTIVE"
         st.session_state.last_public_notice = (
-            f"Adaptive throttling level {level}: CPU={cpu:.1f}%, RAM={ram:.1f}%. "
-            "YOLO, frame sampling and analysis intervals adjusted."
+            f"Adaptive throttling L{level}: CPU={cpu:.1f}%, RAM={ram:.1f}%. "
+            "Detection frequency and sample resolution are reduced."
             if level else ""
         )
         return level
+
+    @staticmethod
+    def poll_runtime_pressure() -> int:
+        """Update the governor even when Streamlit fragments are delayed.
+
+        This is intentionally safe for WebRTC worker threads: no st.session_state
+        or st.secrets access. psutil is sampled at most once per second across
+        camera workers and Streamlit fragments.
+        """
+        now = time.monotonic()
+        with RESOURCE_LOAD_LOCK:
+            if now - RESOURCE_LOAD["updated_at"] < 1.0:
+                return int(RESOURCE_LOAD["level"])
+            # Reserve the next sampling slot to prevent concurrent probes.
+            RESOURCE_LOAD["updated_at"] = now
+        try:
+            cpu = float(psutil.cpu_percent(interval=None))
+            ram = float(psutil.virtual_memory().percent)
+        except Exception as exc:
+            LOG.debug("Unable to sample CPU/RAM pressure: %s", exc)
+            return ResourceGovernor.level()
+        return ResourceGovernor._publish_pressure(cpu, ram, now)
 
     @staticmethod
     def level() -> int:
@@ -1213,20 +1232,32 @@ def draw_browser_camera_hud(frame_bgr: np.ndarray, fps: float, yolo_detected: bo
     )
     font = cv2.FONT_HERSHEY_SIMPLEX
     lines = (
-        ("CAM_01 [LIVE]", (0, 190, 0)),
+        ("CAM_01 [LIVE]", (0, 255, 0)),
         (f"FPS: {fps:.1f} | YOLO: {'DETECTED' if yolo_detected else 'CLEAR'}", (0, 255, 0)),
         (f"INF: {inference_count} | STATUS: {severity}", color),
     )
+    # Reconstruct the tiny title area before painting its single green label.
+    # Some existing frames / old 3x3 composites carry a previously stamped
+    # black CAM_01 label. Inpainting just this ROI clears any old lettering
+    # without adding a black backdrop or erasing the rest of the camera feed.
+    if h >= 35 and w >= 90:
+        right = min(w, 240)
+        region = frame_bgr[2:31, 2:right]
+        if region.shape[0] >= 27 and region.shape[1] >= 82:
+            mask = np.zeros(region.shape[:2], dtype=np.uint8)
+            mask[3:24, 4:-4] = 255
+            region[:] = cv2.inpaint(region, mask, 2, cv2.INPAINT_TELEA)
+
     for row, (message, text_color) in enumerate(lines):
         x, y = 9, 19 + row * 22
         if y >= h:
             break
-        # Thin camera title, then bold green monitoring values, as in reference.
+        # Use a single unoutlined draw. LINE_8 gives the thin camera title a
+        # clean edge without the dark antialias halo seen after WebRTC scaling.
         font_scale = (0.42 if row == 0 else 0.50) if w >= 320 else 0.36
         thickness = 1 if row == 0 else 2
-        # Black text stroke (not a filled panel) improves readability over fire.
-        cv2.putText(frame_bgr, message, (x, y), font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_8)
-        cv2.putText(frame_bgr, message, (x, y), font, font_scale, text_color, thickness, cv2.LINE_8)
+        cv2.putText(frame_bgr, message, (x, y), font, font_scale,
+                    text_color, thickness, cv2.LINE_8 if row == 0 else cv2.LINE_AA)
     return frame_bgr
 
 
@@ -1286,8 +1317,10 @@ if WEBRTC_AVAILABLE:
 
         def recv(self, frame):
             now = time.monotonic()
-            # Apply adaptive sampling, not just YOLO throttling, when CPU/RAM is high.
-            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"] * (1, 2, 4)[ResourceGovernor.level()]
+            # Independent CPU/RAM sampling lets the WebRTC worker throttle
+            # before Streamlit's resource-metrics fragment refreshes.
+            throttle_level = ResourceGovernor.poll_runtime_pressure()
+            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"] * (1, 2, 4)[throttle_level]
             with self._lock:
                 previous = self._last_tick
                 self._last_tick = now
@@ -3115,7 +3148,7 @@ def live_camera_fragment() -> None:
         st.fragment(_live_webrtc_body, run_every=CONFIG["WEBRTC_TICK_SEC"])()
     else:
         # Local webcam: the exact flow of the working localhost project.
-        st.fragment(_live_local_camera_body, run_every=0.1)()
+        st.fragment(_live_local_camera_body, run_every=0.18)()
 
 
 def _connection_help_text() -> str:
@@ -3274,7 +3307,7 @@ def _live_local_camera_body() -> None:
         # Camera refresh must not wait for expensive AI/visual analysis on
         # every Streamlit fragment rerun; schedule the pipeline independently.
         last_pipeline = st.session_state.get("last_local_pipeline_ts", 0.0)
-        pressure = ResourceGovernor.level()
+        pressure = ResourceGovernor.poll_runtime_pressure()
         analysis_interval = CONFIG["LOCAL_PIPELINE_INTERVAL_SEC"] * (1, 1.6, 3.0)[pressure]
         if current_time - last_pipeline >= analysis_interval:
             st.session_state.last_local_pipeline_ts = current_time
