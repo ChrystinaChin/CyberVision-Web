@@ -104,6 +104,31 @@ CLOUD_SYNC_LOCK = _CLOUD_SHARED["sync_lock"]
 CLOUD_STATUS = _CLOUD_SHARED["status"]
 CLOUD_STATUS_LOCK = _CLOUD_SHARED["status_lock"]
 
+
+@st.cache_resource(show_spinner=False)
+def _shared_resource_runtime() -> Dict[str, Any]:
+    """One shared resource sample for *all* Streamlit reruns and camera threads.
+
+    st.cache_resource intentionally retains this object even when Streamlit
+    re-executes main.py in a different Python script namespace. Keeping the
+    monitor's counters in module globals instead made the dashboard display
+    0.0% while the old daemon thread kept updating a different dictionary.
+    """
+    return {
+        "lock": threading.RLock(),
+        "load": {
+            "level": 0, "cpu": 0.0, "ram": 0.0, "updated_at": 0.0,
+            "cpu_host": 0.0, "cpu_process": 0.0, "downshift_since": 0.0,
+        },
+        "monitor_lock": threading.Lock(),
+        "monitor_thread": None,
+    }
+
+
+_RESOURCE_SHARED = _shared_resource_runtime()
+RESOURCE_LOAD_LOCK = _RESOURCE_SHARED["lock"]
+RESOURCE_LOAD = _RESOURCE_SHARED["load"]
+
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
@@ -568,8 +593,11 @@ def init_session_state() -> None:
     # earlier deployments before render_video_feed() runs on this rerun.
     st.session_state.browser_cam_mode = BROWSER_MODE_LIVE
 
-    if "use_webrtc" not in st.session_state:
-        needs_browser_camera = is_cloud_environment() or not local_camera_available()
+    if is_cloud_environment():
+        st.session_state.use_webrtc = bool(WEBRTC_AVAILABLE)
+        st.session_state.webrtc_unavailable_on_cloud = not WEBRTC_AVAILABLE
+    elif "use_webrtc" not in st.session_state:
+        needs_browser_camera = not local_camera_available()
         st.session_state.use_webrtc = needs_browser_camera and WEBRTC_AVAILABLE
         st.session_state.webrtc_unavailable_on_cloud = needs_browser_camera and not WEBRTC_AVAILABLE
 
@@ -1418,11 +1446,33 @@ def _resource_monitor_loop() -> None:
             time.sleep(1.0)
 
 
-@st.cache_resource(show_spinner=False)
 def _start_resource_monitor_once() -> bool:
-    # The monitor is process-wide, not per-session. It never touches Streamlit.
-    threading.Thread(target=_resource_monitor_loop, daemon=True,
-                     name="cybervision-resource-governor").start()
+    """Start exactly one live monitor per process, and restart it if it dies.
+
+    The cached runtime owns both the thread and the readings, so a rerun never
+    silently severs the connection between the camera governor and dashboard.
+    """
+    with _RESOURCE_SHARED["monitor_lock"]:
+        existing = _RESOURCE_SHARED["monitor_thread"]
+        if existing is not None and existing.is_alive():
+            return True
+
+        # Immediately show actual resource usage in STANDBY, rather than 0/0
+        # until the one-second background sampling interval has completed.
+        try:
+            host_cpu = float(psutil.cpu_percent(interval=0.10))
+            ram = max(float(psutil.virtual_memory().percent),
+                      _cgroup_memory_percent())
+            ResourceGovernor._publish_pressure(host_cpu, ram, time.monotonic(),
+                                                cpu_host=host_cpu)
+        except Exception as exc:
+            LOG.warning("Initial resource sample failed: %s: %s",
+                        type(exc).__name__, exc)
+
+        worker = threading.Thread(target=_resource_monitor_loop, daemon=True,
+                                  name="cybervision-resource-governor")
+        _RESOURCE_SHARED["monitor_thread"] = worker
+        worker.start()
     return True
 
 
@@ -3285,9 +3335,9 @@ def _render_resource_metrics_body() -> None:
 
 
 def render_resource_metrics_panel() -> None:
-    # Fragments refresh metrics without remounting WebRTC or the setup controls.
-    refresh = 3.0 if st.session_state.get("camera_running", False) else None
-    st.fragment(_render_resource_metrics_body, run_every=refresh)()
+    # Keep CPU / RAM visible in STANDBY as well as during a live camera stream.
+    # This fragment does not remount the camera or the Start/Stop buttons.
+    st.fragment(_render_resource_metrics_body, run_every=3.0)()
 
 
 # DASHBOARD FUNCTIONS RESTORED AFTER SERVER SETUP REFACTOR
@@ -3298,16 +3348,31 @@ def _browser_snapshot_mode() -> bool:
     )
 
 
-def render_dashboard_header() -> None:
-    cam_running = st.session_state.camera_running or _browser_snapshot_mode()
+def _render_dashboard_header_body() -> None:
+    cam_running = bool(st.session_state.get("camera_running")) or _browser_snapshot_mode()
     yolo_ready = is_yolo_model_available()
 
-    if cam_running and yolo_ready:
-        pill_text, pill_color = "YOLO ACTIVE", "#16a34a"
-    elif cam_running:
-        pill_text, pill_color = "FALLBACK MODE", "#ca8a04"
-    else:
+    if not cam_running:
         pill_text, pill_color = "STANDBY", "#6b7280"
+    elif st.session_state.get("use_webrtc"):
+        processor = _get_browser_processor()
+        health = processor.health() if processor is not None else {}
+        age = health.get("age_sec")
+        receiving = (health.get("frames_received", 0) > 0
+                     and not health.get("ended", False)
+                     and age is not None
+                     and age < CONFIG["WEBRTC_FRAME_MAX_AGE_SEC"])
+        if receiving:
+            pill_text, pill_color = (("YOLO ACTIVE", "#16a34a") if yolo_ready
+                                     else ("FALLBACK MODE", "#ca8a04"))
+        elif processor is not None and health.get("frames_received", 0) > 0:
+            pill_text, pill_color = "RECONNECTING", "#ca8a04"
+        else:
+            pill_text, pill_color = "CONNECTING", "#ca8a04"
+    elif yolo_ready:
+        pill_text, pill_color = "YOLO ACTIVE", "#16a34a"
+    else:
+        pill_text, pill_color = "FALLBACK MODE", "#ca8a04"
 
     st.markdown(
         f"""
@@ -3324,6 +3389,12 @@ def render_dashboard_header() -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def render_dashboard_header() -> None:
+    # Status updates as camera connectivity changes without restarting WebRTC.
+    refresh = 2.0 if st.session_state.get("camera_running", False) else None
+    st.fragment(_render_dashboard_header_body, run_every=refresh)()
 
 
 def _render_live_stats_body() -> None:
@@ -3393,13 +3464,18 @@ def render_video_status_bar() -> None:
     st.fragment(_render_video_status_bar_body, run_every=refresh)()
 
 
-def render_resource_trend_preview() -> None:
+def _render_resource_trend_preview_body() -> None:
     metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
     if metrics_df.empty:
         st.info("No resource metrics yet.")
         return
     metrics_df = metrics_df.set_index("time")
     st.line_chart(metrics_df[["cpu", "ram"]], height=180)
+
+
+def render_resource_trend_preview() -> None:
+    # Resource data continues changing when detection is paused.
+    st.fragment(_render_resource_trend_preview_body, run_every=5.0)()
 
 
 # =============================================================================
@@ -3714,6 +3790,14 @@ def render_video_feed() -> None:
             st.session_state._frame_processing_busy = False
             st.session_state._frame_processing_busy_since = 0.0
 
+            # Mount a fresh transport on every explicit Start, not the old
+            # component identity retained after Stop/reconnect.
+            if st.session_state.get("use_webrtc"):
+                st.session_state.webrtc_connection_id += 1
+                st.session_state.webrtc_ctx = None
+                st.session_state.get("_cam_holder", {}).clear()
+                st.session_state.webrtc_auto_reconnect_history = []
+
             if st.session_state.get("yolo_detector") is None:
                 st.session_state.yolo_detector = YOLOFireSmokeDetector()
 
@@ -3728,6 +3812,9 @@ def render_video_feed() -> None:
             st.session_state._frame_processing_busy = False
             st.session_state._frame_processing_busy_since = 0.0
             st.session_state.get("_cam_holder", {}).clear()
+            st.session_state.webrtc_ctx = None
+            st.session_state.fps = 0.0
+            st.session_state.frames_received = 0
             st.session_state.last_visual_result = None
             st.session_state.visual_prev_frame = None
             release_camera()
