@@ -1583,6 +1583,12 @@ if WEBRTC_AVAILABLE:
                             self._analysis_severity = YOLOFireSmokeDetector.hazard_severity(result)
                     self._yolo_busy = False
 
+        def attach_detector(self, detector) -> None:
+            """Attach the already-loaded YOLO model after the browser stream starts."""
+            with self._lock:
+                if detector is not None and self._detector is None:
+                    self._detector = detector
+
         def set_analysis_severity(self, severity: str) -> None:
             """Called by Streamlit pipeline, not by a WebRTC worker."""
             with self._lock:
@@ -1713,12 +1719,12 @@ else:
 
 
 def _get_browser_processor():
-    """Find the live processor (the factory records it in a per-session dict)."""
-    processor = (st.session_state.get("_cam_holder") or {}).get("proc")
-    if processor is None:
-        ctx = st.session_state.get("webrtc_ctx")
-        processor = getattr(ctx, "video_processor", None)
-    return processor
+    """Return the processor for the currently playing browser WebRTC context."""
+    ctx = st.session_state.get("webrtc_ctx")
+    if ctx is None or not bool(getattr(getattr(ctx, "state", None), "playing", False)):
+        return None
+    # Never return a processor retained from an old, stopped connection.
+    return getattr(ctx, "video_processor", None)
 
 
 def _get_secret(name: str) -> Optional[str]:
@@ -2024,90 +2030,91 @@ def _describe_ice_servers(ice_servers: list) -> str:
 
 
 def render_browser_camera_widget() -> None:
-    """Mounts the WebRTC connector. Its <video> is the live, annotated display.
+    """Stable browser-native WebRTC player for Streamlit Cloud.
 
-    SENDRECV: the browser sends its camera, the server-side processor draws the
-    detections on each frame and sends the annotated video straight back.
+    Important: this widget is mounted even when stopped. The player's own
+    START/STOP controls are the actual browser user gesture for getUserMedia;
+    a Python st.button followed by a rerun cannot reliably substitute for it.
+    Leave desired_playing_state unset so those controls remain visible.
     """
     if not WEBRTC_AVAILABLE:
         st.error(
-            "Browser camera mode requires the `streamlit-webrtc` and `av` packages, "
-            "which are listed in requirements.txt but failed to import. Check the "
-            "deployment logs — this is usually a missing system library (see "
-            "packages.txt: libavformat-dev, libavdevice-dev, libgl1)."
+            "The browser-camera component could not load. Check deployment logs "
+            "and install streamlit-webrtc and av from requirements.txt."
         )
         return
 
     ice_servers = get_ice_servers()
     holder = st.session_state.setdefault("_cam_holder", {})
 
-    # Create the detector here, on the script thread, and hand it to the
-    # processor (the factory itself runs in a WebRTC worker thread).
-    detector = st.session_state.get("yolo_detector")
-    if detector is None:
-        detector = YOLOFireSmokeDetector()
-        st.session_state.yolo_detector = detector
-
     def _processor_factory():
-        proc = BrowserCameraProcessor(detector)
+        # Starting a camera must not wait for a heavy YOLO model to load.
+        # The detection pipeline attaches the model after media arrives.
+        proc = BrowserCameraProcessor()
         holder["proc"] = proc
         return proc
 
     with st.container(key="webrtc_transport"):
-        ctx = webrtc_streamer(
-            key=f"cybervision-browser-camera-v3-{st.session_state.get('webrtc_connection_id', 0)}",
-            mode=WebRtcMode.SENDRECV,
-            # Let the built-in START control take over if autoplay cannot get
-            # browser permission. Automatic mode is the default.
-            desired_playing_state=(
-                None if st.session_state.get("webrtc_manual_start", False) else True
-            ),
-            rtc_configuration={"iceServers": ice_servers},
-            # These are preferences rather than hard maximums. Some cameras
-            # reject max=320/max=240 with OverconstrainedError.
-            media_stream_constraints={
-                "video": {
-                    "width": {"ideal": 320},
-                    "height": {"ideal": 240},
-                    "frameRate": {"ideal": 10},
+        try:
+            ctx = webrtc_streamer(
+                key="cybervision-web-native-start-v1",  # fixed across ALL reruns
+                mode=WebRtcMode.SENDRECV,
+                rtc_configuration={"iceServers": ice_servers},
+                media_stream_constraints={
+                    "video": {
+                        "width": {"ideal": 320},
+                        "height": {"ideal": 240},
+                        "frameRate": {"ideal": 10},
+                    },
+                    "audio": False,
                 },
-                "audio": False,
-            },
-            video_processor_factory=_processor_factory,
-            video_html_attrs={
-                "autoPlay": True,
-                "controls": False,
-                "muted": True,
-                "playsInline": True,
-                "style": {
-                    "width": "100%",
-                    "maxWidth": "100%",
-                    "borderRadius": "14px",
+                video_processor_factory=_processor_factory,
+                media_toggle_controls=False,
+                video_html_attrs={
+                    "autoPlay": True, "controls": False,
+                    "muted": True, "playsInline": True,
+                    "style": {"width": "100%", "maxWidth": "100%", "borderRadius": "14px"},
                 },
-            },
-            async_processing=True,
-        )
+                async_processing=True,
+            )
+        except Exception as exc:
+            LOG.exception("Failed to mount web camera component: %s", exc)
+            st.error(f"Browser camera cannot initialize: {type(exc).__name__}: {exc}")
+            st.session_state.camera_running = False
+            return
 
     st.session_state.webrtc_ctx = ctx
+    is_playing = bool(getattr(getattr(ctx, "state", None), "playing", False))
+    was_playing = bool(st.session_state.get("camera_running", False))
+    st.session_state.camera_running = is_playing
+    if is_playing and not was_playing:
+        st.session_state.camera_started_at = time.time()
+        st.session_state.last_pipeline_ts = 0.0
+        st.session_state.last_error = ""
+        st.session_state.fps = 0.0
+        st.session_state._frame_processing_busy = False
+        st.session_state._frame_processing_busy_since = 0.0
+    elif was_playing and not is_playing:
+        st.session_state.fps = 0.0
+        st.session_state.frames_received = 0
+        st.session_state.yolo_severity = "NORMAL"
+        st.session_state.alarm_active = False
+        st.session_state.last_visual_result = None
+        st.session_state.visual_prev_frame = None
+        st.session_state._frame_processing_busy = False
+        st.session_state._frame_processing_busy_since = 0.0
+        holder.clear()
 
-    state = getattr(ctx, "state", None)
-    playing = bool(state is not None and getattr(state, "playing", False))
+    if not is_playing:
+        st.caption("Click **START** in the camera player to enable your browser webcam; allow camera access if prompted.")
+
     ice_note = _describe_ice_servers(ice_servers)
-
-    if st.session_state.get("webrtc_manual_start", False) and not playing:
-        st.info(
-            "Automatic camera startup did not complete. Click **START** in the "
-            "camera player below and allow browser camera access."
-        )
-
-    if ice_note.startswith(":material/info:") and not playing:
+    if ice_note.startswith(":material/info:"):
         st.warning(
-            "No TURN relay is configured, so a hosted app usually cannot connect to your "
-            "browser camera. Add CLOUDFLARE_TURN_KEY_ID + CLOUDFLARE_TURN_KEY_API_TOKEN "
-            "(or METERED_API_KEY + METERED_DOMAIN) to your Streamlit secrets and reboot the app.",
+            "Only STUN is configured. On hosted networks the webcam may not "
+            "connect without a TURN relay. Check your Cloudflare TURN secrets.",
             icon=":material/warning:",
         )
-
 
 # =============================================================================
 # LOCAL CAMERA HANDLING & 3x3 MATRIX (localhost behaviour of the working project)
@@ -3341,10 +3348,12 @@ def _render_resource_metrics_body() -> None:
     if st.session_state.last_error:
         st.info("Model/YARA backend notice: Active fallback running.")
 
-    if not is_yolo_model_available():
+    if not YOLO_AVAILABLE or not os.path.isfile(CONFIG["YOLO_MODEL_PATH"]):
         with st.expander(":material/error: YOLO not active — details", expanded=True):
-            for label, value in get_yolo_debug_info().items():
-                st.text(f"{label}: {value}")
+            st.text(f"Ultralytics import: {YOLO_AVAILABLE}")
+            st.text(f"Model file available: {os.path.isfile(CONFIG['YOLO_MODEL_PATH'])}")
+            if YOLO_IMPORT_ERROR:
+                st.text(YOLO_IMPORT_ERROR)
 
 
 def render_resource_metrics_panel() -> None:
@@ -3363,7 +3372,8 @@ def _browser_snapshot_mode() -> bool:
 
 def _render_dashboard_header_body() -> None:
     cam_running = bool(st.session_state.get("camera_running")) or _browser_snapshot_mode()
-    yolo_ready = is_yolo_model_available()
+    # Don't load the model on every standby/header refresh; camera startup first.
+    yolo_ready = bool(getattr(st.session_state.get("yolo_detector"), "available", False))
 
     if not cam_running:
         pill_text, pill_color = "STANDBY", "#6b7280"
@@ -3533,8 +3543,8 @@ def _connection_help_text() -> str:
         "Camera stream stalled: " + stage + ". "
         f"Relay setup: {tier}{' - ' + detail if detail else ''}. "
         "A TURN credential response does not guarantee that WebRTC media remains connected. "
-        "Press Reconnect Camera. If it persists, check Streamlit logs, network stability "
-        "and available CPU; then allow camera access again if prompted."
+        "Use STOP then START inside the video player to reconnect. If it persists, "
+        "check Streamlit logs, network stability and available CPU."
     )
 
 
@@ -3551,8 +3561,17 @@ def _live_webrtc_body() -> None:
     status_slot = st.empty()
     render_custom_hazard_toast()
 
-    if not st.session_state.get("camera_running", False):
+    ctx = st.session_state.get("webrtc_ctx")
+    playing = bool(getattr(getattr(ctx, "state", None), "playing", False))
+    if not playing:
+        st.session_state.camera_running = False
+        st.session_state.fps = 0.0
         return
+
+    if not st.session_state.get("camera_running", False):
+        st.session_state.camera_running = True
+        st.session_state.camera_started_at = time.time()
+        st.session_state.last_pipeline_ts = 0.0
 
     if _busy_flag_active():
         return
@@ -3569,51 +3588,13 @@ def _live_webrtc_body() -> None:
         if frame is None:
             st.session_state.fps = 0.0
             waited = time.time() - (st.session_state.get("camera_started_at") or time.time())
-            # Programmatic browser start may be disallowed on some devices.
-            # Offer the component's own gesture-driven START button rather than
-            # leaving the app indefinitely stuck on CONNECTING.
-            if (processor is None and waited >= 9.0
-                    and not st.session_state.get("webrtc_manual_start", False)):
-                st.session_state.webrtc_manual_start = True
-                # A full rerun is required to change the WebRTC component prop;
-                # it happens only once and before any frames have arrived.
-                st.rerun()
-            health = processor.health() if processor is not None else {}
-            last_age = health.get("age_sec")
-            stalled = bool(health.get("ended")) or (
-                last_age is not None and last_age >= CONFIG["WEBRTC_STALL_WARNING_SEC"]
-            )
-            if stalled or waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
-                # Bounded self-recovery: try one automatic reconnect per minute,
-                # at most twice in five minutes. Do not endlessly remount a
-                # failing camera and consume resources.
-                if stalled and last_age is not None and last_age >= CONFIG["WEBRTC_AUTO_RECONNECT_AFTER_SEC"]:
-                    now = time.monotonic()
-                    history = [x for x in st.session_state.get("webrtc_auto_reconnect_history", [])
-                               if now - x < 300]
-                    if len(history) < 2 and (not history or now - history[-1] >= 60):
-                        st.session_state.webrtc_auto_reconnect_history = history + [now]
-                        st.session_state.webrtc_connection_id += 1
-                        st.session_state.webrtc_manual_start = False
-                        st.session_state.get("_cam_holder", {}).clear()
-                        st.session_state.webrtc_ctx = None
-                        st.session_state.camera_started_at = time.time()
-                        st.session_state.fps = 0.0
-                        st.session_state.last_pipeline_ts = 0.0
-                        LOG.warning("WebRTC stalled for %.1fs; attempting bounded reconnect", last_age)
-                        st.rerun()
-                status_slot.warning(_connection_help_text(), icon=":material/warning:")
-                if st.button("Reconnect Camera", key="reconnect_browser_camera", type="primary"):
-                    st.session_state.webrtc_connection_id += 1
-                    st.session_state.webrtc_manual_start = False
-                    st.session_state.get("_cam_holder", {}).clear()
-                    st.session_state.webrtc_ctx = None
-                    st.session_state.camera_started_at = time.time()
-                    st.session_state.last_pipeline_ts = 0.0
-                    st.session_state.fps = 0.0
-                    st.rerun()
+            if waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
+                status_slot.warning(
+                    _connection_help_text() + " Use STOP then START in the camera player to retry.",
+                    icon=":material/warning:",
+                )
             else:
-                status_slot.info("Connecting to browser camera…")
+                status_slot.info("Connecting to your browser camera…")
             return
 
         status_slot.empty()
@@ -3637,6 +3618,9 @@ def _live_webrtc_body() -> None:
         # needs the detections/severity, not the pixels.
         run_detection_pipeline(small, yolo_override=yolo or dict(EMPTY_YOLO_RESULT))
         if processor is not None:
+            # run_detection_pipeline has initialized YOLO on this script thread;
+            # the WebRTC worker can now use it without blocking browser startup.
+            processor.attach_detector(st.session_state.get("yolo_detector"))
             processor.set_analysis_severity(st.session_state.get("yolo_severity", "NORMAL"))
             # WebRTC YOLO worker is the inference producer; the Streamlit-side
             # counter otherwise stays 0 even while detections occur.
@@ -3843,10 +3827,24 @@ def _stop_camera() -> None:
 
 
 def render_video_feed() -> None:
-    if _browser_snapshot_mode():
-        render_snapshot_camera()
+    # Hosted web app: the WebRTC player's own START button initiates the browser
+    # permission request directly. Never route it through st.button + reruns.
+    if is_cloud_environment():
+        if not WEBRTC_AVAILABLE:
+            st.error("Browser camera unavailable: install streamlit-webrtc and av; see deployment logs.")
+            return
+        st.session_state.use_webrtc = True
+
+    if st.session_state.get("use_webrtc"):
+        if _browser_snapshot_mode():
+            render_snapshot_camera()
+            return
+        # Always keep the same WebRTC component mounted, even when stopped.
+        render_browser_camera_widget()
+        live_camera_fragment()
         return
 
+    # Physical cameras are for localhost only; do not use cv2.VideoCapture on web.
     header_col, btn_col1, btn_col2 = st.columns([6, 1, 1])
 
     with btn_col1:
@@ -3863,13 +3861,6 @@ def render_video_feed() -> None:
             on_click=_stop_camera,
         )
 
-    if st.session_state.get("webrtc_unavailable_on_cloud"):
-        st.error(
-            "This deployment has no local camera device, and the browser-camera "
-            "(streamlit-webrtc) packages failed to load — see the deployment logs. "
-            "Detection cannot start until that's fixed."
-        )
-
     if not st.session_state.camera_running:
         video_placeholder = st.empty()
         if st.session_state.get("last_frame_rgb") is not None:
@@ -3881,11 +3872,6 @@ def render_video_feed() -> None:
             )
         st.info("Camera is stopped. Detection paused.")
         return
-
-    # The WebRTC connector is only mounted while the camera is running, so
-    # pressing Stop also releases the visitor's webcam.
-    if st.session_state.get("use_webrtc"):
-        render_browser_camera_widget()
 
     live_camera_fragment()
 
