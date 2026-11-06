@@ -38,9 +38,7 @@ CLOUD_STATUS = {"last_success": "", "last_error": "", "last_attempt": "",
 CLOUD_SYNC_LOCK = threading.Lock()
 YOLO_INFERENCE_LOCK = threading.Lock()
 RESOURCE_LOAD_LOCK = threading.Lock()
-RESOURCE_LOAD = {"level": 0, "cpu": 0.0, "ram": 0.0, "updated_at": 0.0,
-                 "cpu_host": 0.0, "cpu_process": 0.0, "downshift_since": 0.0}
-RESOURCE_DOWNSHIFT_HOLD_SEC = 4.0
+RESOURCE_LOAD = {"level": 0, "cpu": 0.0, "ram": 0.0, "updated_at": 0.0}
 # Google Cloud clients are created only on the Streamlit script thread.
 # Background upload threads never call st.secrets / st.cache_resource.
 CLOUD_CLIENTS_LOCK = threading.Lock()
@@ -71,64 +69,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-
-@st.cache_resource(show_spinner=False)
-def _shared_cloud_runtime():
-    """Process-wide state for the daemon worker and every Streamlit rerun.
-
-    Streamlit executes main.py in fresh script namespaces on reruns. Without a
-    cached shared object, the worker can keep an old client dict and never see
-    the clients created during the next rerun.
-    """
-    return {
-        "clients": {"storage": None, "firestore": None},
-        "clients_lock": threading.RLock(),
-        "sync_lock": threading.Lock(),
-        "status_lock": threading.Lock(),
-        "status": {"last_success": "", "last_error": "", "last_attempt": "",
-                   "storage_success": "", "storage_error": "",
-                   "firestore_success": "", "firestore_error": ""},
-        # Only the Streamlit script thread reads st.secrets. Background threads
-        # may reuse the resolved credentials in memory, never access st.secrets.
-        "auth": {"project": None, "credentials": None},
-        "bucket_name": "cybervision_history",
-        "recovery_lock": threading.Lock(),
-        "last_recovery_attempt": 0.0,
-    }
-
-
-_CLOUD_SHARED = _shared_cloud_runtime()
-CLOUD_CLIENTS = _CLOUD_SHARED["clients"]
-CLOUD_CLIENTS_LOCK = _CLOUD_SHARED["clients_lock"]
-CLOUD_SYNC_LOCK = _CLOUD_SHARED["sync_lock"]
-CLOUD_STATUS = _CLOUD_SHARED["status"]
-CLOUD_STATUS_LOCK = _CLOUD_SHARED["status_lock"]
-
-
-@st.cache_resource(show_spinner=False)
-def _shared_resource_runtime() -> Dict[str, Any]:
-    """One shared resource sample for *all* Streamlit reruns and camera threads.
-
-    st.cache_resource intentionally retains this object even when Streamlit
-    re-executes main.py in a different Python script namespace. Keeping the
-    monitor's counters in module globals instead made the dashboard display
-    0.0% while the old daemon thread kept updating a different dictionary.
-    """
-    return {
-        "lock": threading.RLock(),
-        "load": {
-            "level": 0, "cpu": 0.0, "ram": 0.0, "updated_at": 0.0,
-            "cpu_host": 0.0, "cpu_process": 0.0, "downshift_since": 0.0,
-        },
-        "monitor_lock": threading.Lock(),
-        "monitor_thread": None,
-    }
-
-
-_RESOURCE_SHARED = _shared_resource_runtime()
-RESOURCE_LOAD_LOCK = _RESOURCE_SHARED["lock"]
-RESOURCE_LOAD = _RESOURCE_SHARED["load"]
-
 try:
     from ultralytics import YOLO
     YOLO_AVAILABLE = True
@@ -153,27 +93,14 @@ except Exception:
     OLLAMA_AVAILABLE = False
 
 try:
-    from google.cloud import storage
-    GCS_AVAILABLE = True
+    from google.cloud import firestore, storage
+    from google.oauth2 import service_account as gcp_service_account
+    GCP_AVAILABLE = True
 except Exception:
     storage = None
-    GCS_AVAILABLE = False
-
-try:
-    from google.cloud import firestore
-    FIRESTORE_AVAILABLE = True
-except Exception:
     firestore = None
-    FIRESTORE_AVAILABLE = False
-
-try:
-    from google.oauth2 import service_account as gcp_service_account
-    GOOGLE_AUTH_AVAILABLE = True
-except Exception:
     gcp_service_account = None
-    GOOGLE_AUTH_AVAILABLE = False
-
-GCP_AVAILABLE = bool(GCS_AVAILABLE or FIRESTORE_AVAILABLE)
+    GCP_AVAILABLE = False
 
 try:
     import av
@@ -252,15 +179,14 @@ CONFIG: Dict[str, Any] = {
     "VLM_MODEL": "moondream",
     "CAMERA_INDEX": 0,
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
-    "WEBRTC_ANALYSIS_WIDTH": 320,       # limit browser-side OpenCV analysis resolution
-    "WEBRTC_TICK_SEC": 1.0,             # analysis/status tick; browser video is independent
-    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 1.75,  # scheduled CPU inference stays off real-time video path
-    "WEBRTC_SAMPLE_INTERVAL_SEC": 0.4,   # analysis only: maximum 2.5 samples/s, stream still sends every frame
+    "WEBRTC_ANALYSIS_WIDTH": 320,       # browser-camera frames are analysed at this width
+    "WEBRTC_TICK_SEC": 0.75,            # alert/stat tick in browser-camera mode (draws no images)
+    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 1.25,  # YOLO stays off the real-time video path
+    "WEBRTC_SAMPLE_INTERVAL_SEC": 0.25,  # maximum 4 sampled analysis frames / second
     "WEBRTC_STALL_WARNING_SEC": 6.0,  # show a reconnect action once frames stop
-    "YOLO_CPU_THREADS": 1,  # preserve CPU capacity for WebRTC encoding and UI
+    "YOLO_CPU_THREADS": 2,  # leave CPU capacity for WebRTC video encoding
     "WEBRTC_YOLO_RESULT_TTL_SEC": 3.0,  # boxes older than this are dropped
-    "WEBRTC_FRAME_MAX_AGE_SEC": 5.0,    # tolerate adaptive sampling under CPU pressure
-    "LOCAL_PIPELINE_INTERVAL_SEC": 0.65,  # keep local camera redraws independent of AI inference
+    "WEBRTC_FRAME_MAX_AGE_SEC": 4.0,    # a frame older than this counts as "no signal"
     "SNAPSHOT_ANALYSIS_WIDTH": 640,
     "CAMERA_CONNECT_HINT_SEC": 15,
     "BUSY_FLAG_TIMEOUT_SEC": 8.0,
@@ -276,13 +202,6 @@ CONFIG: Dict[str, Any] = {
     "LATENCY_HISTORY_MAX": 100,
     "TOAST_DISPLAY_SECONDS": 6.0,
     "CLOUD_UPLOAD_MIN_INTERVAL_SEC": 10.0,  # bounded cloud writes per hazard episode
-    "CLOUD_SYNC_RETRY_SEC": 5.0,
-    "CLOUD_CLIENT_RETRY_SEC": 10.0,
-    "CLOUD_WRITE_TIMEOUT_SEC": 10.0,
-    "VISUAL_SMOKE_MIN_RATIO": 0.10,  # Restore localhost baseline
-    "VISUAL_SMOKE_MOTION_MIN_RATIO": 0.012,
-    "ENABLE_VISUAL_ALERT_FALLBACK": False,  # Localhost alerts were YOLO-led
-    "WEBRTC_AUTO_RECONNECT_AFTER_SEC": 9.0,
     "YARA_RULE_PATH": "hazard_rules.yar",
     # GCP Credentials & Bucket Configuration
     "GCP_BUCKET": "cybervision_history",
@@ -293,12 +212,12 @@ CONFIG: Dict[str, Any] = {
         os.path.dirname(os.path.abspath(__file__)),
         "YOLO_dataset.pt",
     ),
-    "YOLO_CONFIDENCE": 0.45,  # Match working localhost main.py
-    "YOLO_FIRE_CONFIDENCE": 0.45,
-    "YOLO_SMOKE_CONFIDENCE": 0.45,
+    "YOLO_CONFIDENCE": 0.22,  # model proposal threshold, then apply per-class thresholds
+    "YOLO_FIRE_CONFIDENCE": 0.35,
+    "YOLO_SMOKE_CONFIDENCE": 0.25,
     "YOLO_IMAGE_SIZE": 416,  # 160 px removed too much detail for diffuse smoke
     "YOLO_EVERY_N_FRAMES": 8,
-    "VISUAL_DETECT_EVERY_N_FRAMES": 3,  # Match localhost analysis cadence
+    "VISUAL_DETECT_EVERY_N_FRAMES": 4,
 }
 
 SEVERITY_STYLE = {
@@ -373,50 +292,6 @@ def get_cloud_runtime_clients() -> Tuple[Optional[Any], Optional[Any]]:
         return CLOUD_CLIENTS["storage"], CLOUD_CLIENTS["firestore"]
 
 
-def recover_cloud_clients() -> Tuple[Optional[Any], Optional[Any]]:
-    """Recreate failed client handles after connectivity or transient init errors.
-
-    Called on the background worker and during queued sync. Uses only the
-    project and credentials resolved by get_gcp_clients() on Streamlit's script
-    thread. A healthy client can retry network writes without reconstruction.
-    """
-    gcs, db = get_cloud_runtime_clients()
-    if (gcs is not None or not GCS_AVAILABLE) and (db is not None or not FIRESTORE_AVAILABLE):
-        return gcs, db
-    if not _CLOUD_SHARED["recovery_lock"].acquire(blocking=False):
-        return gcs, db
-    try:
-        now = time.monotonic()
-        if now - _CLOUD_SHARED["last_recovery_attempt"] < CONFIG["CLOUD_CLIENT_RETRY_SEC"]:
-            return get_cloud_runtime_clients()
-        _CLOUD_SHARED["last_recovery_attempt"] = now
-        with CLOUD_CLIENTS_LOCK:
-            project = _CLOUD_SHARED["auth"]["project"]
-            credentials = _CLOUD_SHARED["auth"]["credentials"]
-        if not project or credentials is None:
-            # Streamlit secrets cannot safely be read from this thread.
-            return get_cloud_runtime_clients()
-        if gcs is None and GCS_AVAILABLE:
-            try:
-                gcs = storage.Client(credentials=credentials, project=project)
-                with CLOUD_CLIENTS_LOCK:
-                    CLOUD_CLIENTS["storage"] = gcs
-            except Exception as exc:
-                _update_cloud_status(False,
-                    f"Storage reconnect: {type(exc).__name__}: {exc}", service="storage")
-        if db is None and FIRESTORE_AVAILABLE:
-            try:
-                db = firestore.Client(credentials=credentials, project=project)
-                with CLOUD_CLIENTS_LOCK:
-                    CLOUD_CLIENTS["firestore"] = db
-            except Exception as exc:
-                _update_cloud_status(False,
-                    f"Firestore reconnect: {type(exc).__name__}: {exc}", service="firestore")
-        return get_cloud_runtime_clients()
-    finally:
-        _CLOUD_SHARED["recovery_lock"].release()
-
-
 def pending_cloud_counts() -> Tuple[int, int]:
     """Number of Firestore rows and complete image/JSON pairs awaiting upload."""
     try:
@@ -434,59 +309,49 @@ def pending_cloud_counts() -> Tuple[int, int]:
 
 
 def sync_cloud_once() -> None:
-    """Flush queued hazards to any ready cloud backend, even after connectivity returns.
-
-    The local database and image files are *temporary pending buffers*. Never
-    delete them because a connection probe says 'online': delete only after an
-    acknowledged remote write. Each service is retried independently, with
-    idempotent event IDs so reconnects cannot duplicate records.
-    """
+    """Serialize retries. A failed GCS or Firestore write remains pending."""
     if not CLOUD_SYNC_LOCK.acquire(blocking=False):
         return
     try:
+        pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
+        has_images = os.path.isdir(pending_dir) and any(
+            f.endswith(".jpg") for f in os.listdir(pending_dir))
         with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
-            # `synced=1` is a legacy state. Rows already confirmed remotely
-            # should not accumulate as misleading local pending logs.
-            conn.execute("DELETE FROM pending_events WHERE synced=1")
-            events = conn.execute("""SELECT id, timestamp, severity, description,
-                camera_id, event_uuid FROM pending_events WHERE synced=0
-                ORDER BY id LIMIT 30""").fetchall()
-
-        gcs_client, db_client = recover_cloud_clients()
-        if events and db_client is None:
-            _update_cloud_status(False, "Firestore client unavailable; events retained for retry", service="firestore")
-        if db_client is not None:
-            for event_id, ts, sev, desc, cam_id, event_uuid in events:
+            has_events = conn.execute(
+                "SELECT EXISTS(SELECT 1 FROM pending_events WHERE synced=0)"
+            ).fetchone()[0]
+        if not has_images and not has_events:
+            return
+        if not GCP_AVAILABLE:
+            _update_cloud_status(False, "Google Cloud SDK not installed.")
+            return
+        gcs_client, db_client = get_cloud_runtime_clients()
+        if gcs_client is None or db_client is None:
+            _update_cloud_status(False, "Cloud clients not ready. Check SDK, service account and project in Server Setup.")
+            return
+        # Event database is separate from GCS image backups: retry either independently.
+        with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
+            rows = conn.execute("""SELECT id, timestamp, severity, description,
+                camera_id, event_uuid FROM pending_events WHERE synced = 0 ORDER BY id LIMIT 30""").fetchall()
+            for event_id, ts, sev, desc, cam_id, event_uuid in rows:
                 event_uuid = event_uuid or uuid.uuid4().hex
-                # Commit IDs before remote attempt so retries are idempotent.
-                with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
-                    conn.execute("UPDATE pending_events SET event_uuid=? WHERE id=?", (event_uuid, event_id))
+                conn.execute("UPDATE pending_events SET event_uuid = ? WHERE id = ?",
+                             (event_uuid, event_id))
                 try:
                     db_client.collection("hazard_events").document(event_uuid).set({
                         "event_id": event_uuid, "timestamp": ts, "severity": sev,
                         "description": desc, "camera_id": cam_id,
                         "synced_at": firestore.SERVER_TIMESTAMP,
-                    }, timeout=CONFIG["CLOUD_WRITE_TIMEOUT_SEC"])
-                    # Remove the temporary local record ONLY after remote ack.
-                    with sqlite3.connect(CONFIG["DB_FILE"], timeout=10) as conn:
-                        conn.execute("DELETE FROM pending_events WHERE id=?", (event_id,))
-                    _update_cloud_status(True, "Firestore hazard event synced", service="firestore")
+                    })
+                    conn.execute("UPDATE pending_events SET synced = 1 WHERE id = ?", (event_id,))
+                    conn.commit()
+                    _update_cloud_status(True, "Firestore event uploaded", service="firestore")
                 except Exception as exc:
-                    _update_cloud_status(False,
-                        f"Firestore write failed ({type(exc).__name__}): {exc}",
-                        service="firestore")
-                    # Avoid holding a DB lock during a network failure/retry.
+                    _update_cloud_status(False, f"Firestore: {type(exc).__name__}: {exc}", service="firestore")
                     break
-
-        pending_dir = CONFIG["PENDING_UPLOADS_DIR"]
-        images_pending = os.path.isdir(pending_dir) and any(
-            name.endswith(".jpg") for name in os.listdir(pending_dir))
-        if images_pending and gcs_client is None:
-            _update_cloud_status(False, "Cloud Storage client unavailable; images retained for retry", service="storage")
-        if gcs_client is not None and images_pending:
-            flush_pending_cloud_uploads(gcs_client)
+        flush_pending_cloud_uploads(gcs_client)
     except Exception as exc:
-        _update_cloud_status(False, f"Cloud sync error: {type(exc).__name__}: {exc}")
+        _update_cloud_status(False, f"Cloud sync: {type(exc).__name__}: {exc}")
     finally:
         CLOUD_SYNC_LOCK.release()
 
@@ -497,7 +362,7 @@ def sync_worker_loop() -> None:
             sync_cloud_once()
         except Exception as exc:
             LOG.exception("Unexpected cloud worker failure: %s", exc)
-        time.sleep(CONFIG["CLOUD_SYNC_RETRY_SEC"])
+        time.sleep(10)
 
 @st.cache_resource(show_spinner=False)
 def _start_sync_thread_once() -> bool:
@@ -508,20 +373,16 @@ def _start_sync_thread_once() -> bool:
 
 
 def start_sync_thread() -> None:
-    """Initialize cloud clients on Streamlit's script thread, then retry in background."""
+    # Resolve Streamlit secrets and SDK clients only on the script thread.
     configure_cloud_from_secrets()
     gcs, db = get_gcp_clients() if GCP_AVAILABLE else (None, None)
     with CLOUD_CLIENTS_LOCK:
         CLOUD_CLIENTS.update(storage=gcs, firestore=db)
-    # The old toggle was removed. Every confirmed hazard is queued regardless
-    # of whether authentication or the network is currently available.
-    st.session_state.cloud_sync_enabled = True
-    if not GCS_AVAILABLE or not FIRESTORE_AVAILABLE:
-        LOG.warning("Google Cloud backends missing: Storage=%s Firestore=%s", GCS_AVAILABLE, FIRESTORE_AVAILABLE)
-    if gcs is None or db is None:
-        with CLOUD_STATUS_LOCK:
-            last_failure = CLOUD_STATUS.get("last_error", "cloud clients unavailable")
-        LOG.warning("Cloud uploads will retry after configuration is repaired: %s", last_failure)
+    # Previously a hidden "local backup only" toggle was the sole control.
+    # Synchronization is now automatic when cloud clients are usable.
+    st.session_state.cloud_sync_enabled = bool(gcs is not None and db is not None)
+    if not GCP_AVAILABLE:
+        _update_cloud_status(False, "Install google-cloud-firestore, google-cloud-storage, google-auth.")
     _start_sync_thread_once()
 
 
@@ -549,9 +410,7 @@ def init_session_state() -> None:
         "vlm_context": "READY",
         "last_error": "",
         "last_public_notice": "",
-        # Automatic cloud-first event buffering, independent of connection state.
-        # Missing/expired credentials should not silently discard hazard backups.
-        "cloud_sync_enabled": True,
+        "cloud_sync_enabled": bool(GCP_AVAILABLE and _get_gcp_service_account_info()),
         "fps": 0.0,
         "last_frame_time": time.time(),
         "camera_started_at": 0.0,
@@ -569,8 +428,6 @@ def init_session_state() -> None:
         "last_cloud_upload_ts": 0.0,
         "last_cloud_hazard_type": "",
         "last_pipeline_ts": 0.0,
-        "last_local_pipeline_ts": 0.0,
-        "last_local_yolo_result": None,
         "visual_smoke_streak": 0,
         "visual_fire_streak": 0,
         "visual_prev_frame": None,
@@ -580,8 +437,6 @@ def init_session_state() -> None:
         "browser_cam_mode": BROWSER_MODE_LIVE,
         "webrtc_ctx": None,
         "webrtc_connection_id": 0,
-        "webrtc_manual_start": False,
-        "webrtc_auto_reconnect_history": [],
         "_frame_processing_busy": False,
         "_frame_processing_busy_since": 0.0,
     }
@@ -594,11 +449,8 @@ def init_session_state() -> None:
     # earlier deployments before render_video_feed() runs on this rerun.
     st.session_state.browser_cam_mode = BROWSER_MODE_LIVE
 
-    if is_cloud_environment():
-        st.session_state.use_webrtc = bool(WEBRTC_AVAILABLE)
-        st.session_state.webrtc_unavailable_on_cloud = not WEBRTC_AVAILABLE
-    elif "use_webrtc" not in st.session_state:
-        needs_browser_camera = not local_camera_available()
+    if "use_webrtc" not in st.session_state:
+        needs_browser_camera = is_cloud_environment() or not local_camera_available()
         st.session_state.use_webrtc = needs_browser_camera and WEBRTC_AVAILABLE
         st.session_state.webrtc_unavailable_on_cloud = needs_browser_camera and not WEBRTC_AVAILABLE
 
@@ -1252,94 +1104,58 @@ def render_custom_hazard_toast() -> None:
 class SystemMonitor:
     @staticmethod
     def get_metrics() -> Dict[str, Any]:
-        """Display the exact SAME cached readings that control throttling.
-
-        Calling psutil.cpu_percent() from multiple Streamlit fragments previously
-        disturbed the nonblocking psutil sampling baseline in the WebRTC worker,
-        intermittently clearing L2 even when CPU remained saturated.
-        """
-        with RESOURCE_LOAD_LOCK:
-            cpu = float(RESOURCE_LOAD["cpu"])
-            ram = float(RESOURCE_LOAD["ram"])
-        metrics = {"time": datetime.now().strftime("%H:%M:%S"),
-                   "cpu": cpu, "ram": ram}
         try:
+            cpu = float(psutil.cpu_percent(interval=0.01))
+            ram = float(psutil.virtual_memory().percent)
+
+            metrics = {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "cpu": cpu,
+                "ram": ram,
+            }
+
             st.session_state.metrics_history.append(metrics)
+            return metrics
         except Exception:
-            pass
-        return metrics
+            return {
+                "time": datetime.now().strftime("%H:%M:%S"),
+                "cpu": 0.0,
+                "ram": 0.0,
+            }
 
 
 class ResourceGovernor:
     @staticmethod
-    def _publish_pressure(cpu: float, ram: float, sampled_at: float,
-                          cpu_host: Optional[float] = None,
-                          cpu_process: Optional[float] = None) -> int:
-        """Publish measured pressure, with hysteresis against one clean sample.
-
-        Escalate instantly; downshift only after 4 seconds of continuously lower
-        pressure. This protects the server from bouncing L2 -> L0 -> L2 while
-        inference/encoding compete for CPU time.
-        """
-        cpu = max(0.0, min(100.0, float(cpu)))
-        ram = max(0.0, min(100.0, float(ram)))
-        requested = 2 if cpu >= 90.0 or ram >= 90.0 else (1 if cpu >= 75.0 or ram >= 80.0 else 0)
-        with RESOURCE_LOAD_LOCK:
-            previous = int(RESOURCE_LOAD["level"])
-            if requested >= previous:
-                level = requested
-                RESOURCE_LOAD["downshift_since"] = 0.0
-            else:
-                since = float(RESOURCE_LOAD.get("downshift_since", 0.0))
-                if not since:
-                    RESOURCE_LOAD["downshift_since"] = sampled_at
-                    level = previous
-                elif sampled_at - since >= RESOURCE_DOWNSHIFT_HOLD_SEC:
-                    level = requested
-                    RESOURCE_LOAD["downshift_since"] = 0.0
-                else:
-                    level = previous
-            RESOURCE_LOAD.update(level=level, cpu=cpu, ram=ram, updated_at=sampled_at)
-            if cpu_host is not None:
-                RESOURCE_LOAD["cpu_host"] = float(cpu_host)
-            if cpu_process is not None:
-                RESOURCE_LOAD["cpu_process"] = float(cpu_process)
-        if level != previous:
-            LOG.warning("Adaptive throttling L%d -> L%d; CPU %.1f%%, RAM %.1f%%; "
-                        "YOLO every %.1fs, pipeline every %.1fs, input %dpx",
-                        previous, level, cpu, ram,
-                        (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 3.0, 5.0)[level],
-                        (1.0, 1.7, 2.7)[level],
-                        (CONFIG["YOLO_IMAGE_SIZE"], 352, 320)[level])
-        return level
+    def check_resource_pressure() -> None:
+        ResourceGovernor.update_from_metrics(SystemMonitor.get_metrics())
 
     @staticmethod
     def update_from_metrics(metrics: Dict[str, Any]) -> int:
-        """Accept a controlled sample (also useful in testing); not used by UI."""
-        level = ResourceGovernor._publish_pressure(
-            float(metrics.get("cpu", 0.0)), float(metrics.get("ram", 0.0)), time.monotonic())
-        st.session_state.resource_throttle_level = level
-        return level
+        """Update the shared governor for both WebRTC workers and script fragments.
 
-    @staticmethod
-    def check_resource_pressure() -> None:
-        # Never re-sample or overwrite the shared resource worker's readings.
-        level = ResourceGovernor.level()
+        CPU >75% or RAM >80% -> medium; CPU >90% or RAM >90% ->
+        critical. Lower values switch to normal. The governor changes actual
+        frame sampling, YOLO size/interval and detection pipeline frequency.
+        """
+        cpu = float(metrics.get("cpu", 0.0))
+        ram = float(metrics.get("ram", 0.0))
+        if cpu >= 90 or ram >= 90:
+            level = 2
+        elif cpu >= 75 or ram >= 80:
+            level = 1
+        else:
+            level = 0
+        with RESOURCE_LOAD_LOCK:
+            RESOURCE_LOAD.update(level=level, cpu=cpu, ram=ram, updated_at=time.monotonic())
         st.session_state.resource_throttle_level = level
         st.session_state.system_status = "RESOURCE_PRESSURE" if level else "HEALTHY"
         st.session_state.vlm_context = "REDUCED" if level else "ACTIVE"
-        with RESOURCE_LOAD_LOCK:
-            cpu, ram = RESOURCE_LOAD["cpu"], RESOURCE_LOAD["ram"]
         st.session_state.last_public_notice = (
-            f"Adaptive throttling L{level}: CPU={cpu:.1f}%, RAM={ram:.1f}%. "
-            "YOLO, sampling, and analysis frequency are reduced."
+            f"Adaptive throttling level {level}: CPU={cpu:.1f}%, RAM={ram:.1f}%. "
+            "YOLO, frame sampling and analysis intervals adjusted."
             if level else ""
         )
-
-    @staticmethod
-    def poll_runtime_pressure() -> int:
-        """Read-only and nonblocking: safe on every WebRTC recv() call."""
-        return ResourceGovernor.level()
+        return level
 
     @staticmethod
     def level() -> int:
@@ -1348,189 +1164,54 @@ class ResourceGovernor:
 
     @staticmethod
     def yolo_interval() -> float:
-        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 3.0, 5.0)[ResourceGovernor.level()]
+        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 2.5, 4.0)[ResourceGovernor.level()]
 
     @staticmethod
     def pipeline_interval() -> float:
-        return (1.0, 1.7, 2.7)[ResourceGovernor.level()]
+        return (0.75, 1.50, 2.5)[ResourceGovernor.level()]
 
     @staticmethod
     def yolo_image_size() -> int:
+        # Each throttle level must use fewer pixels, not more.
+        # Ultralytics rounds to a suitable stride internally.
         return (CONFIG["YOLO_IMAGE_SIZE"], 352, 320)[ResourceGovernor.level()]
 
     @staticmethod
     def recommended_token_budget() -> int:
         return (1024, 256, 128)[ResourceGovernor.level()]
 
-
-def _allocated_cpu_cores() -> float:
-    """CPU limit for the deployed container (psutil host totals may mislead)."""
-    try:
-        allowed = float(len(os.sched_getaffinity(0)))
-    except (AttributeError, OSError):
-        allowed = float(os.cpu_count() or 1)
-    try:
-        # Streamlit Community Cloud and other Linux hosts often use cgroup v2.
-        with open("/sys/fs/cgroup/cpu.max", encoding="utf-8") as cpu_max:
-            quota, period = cpu_max.read().split()[:2]
-        if quota != "max" and float(period) > 0:
-            allowed = min(allowed, float(quota) / float(period))
-    except (OSError, ValueError, IndexError):
-        try:
-            # Fall back to cgroup v1 where present.
-            with open("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", encoding="utf-8") as f:
-                quota = float(f.read().strip())
-            with open("/sys/fs/cgroup/cpu/cpu.cfs_period_us", encoding="utf-8") as f:
-                period = float(f.read().strip())
-            if quota > 0 and period > 0:
-                allowed = min(allowed, quota / period)
-        except (OSError, ValueError):
-            pass
-    return max(0.1, allowed)
-
-
-def _cgroup_memory_percent() -> float:
-    """Account for hosted-container memory quotas hidden by psutil host RAM."""
-    candidates = (
-        ("/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.max"),
-        ("/sys/fs/cgroup/memory/memory.usage_in_bytes",
-         "/sys/fs/cgroup/memory/memory.limit_in_bytes"),
-    )
-    for usage_path, limit_path in candidates:
-        try:
-            with open(usage_path, encoding="utf-8") as f:
-                usage = float(f.read().strip())
-            with open(limit_path, encoding="utf-8") as f:
-                raw_limit = f.read().strip()
-            if raw_limit == "max":
-                continue
-            limit = float(raw_limit)
-            if 0 < limit < 1e17:
-                return max(0.0, min(100.0, 100.0 * usage / limit))
-        except (OSError, ValueError):
-            continue
-    return 0.0
-
-
-def _resource_monitor_loop() -> None:
-    """Single sampler; prevents cross-thread CPU baselines from erasing L2.
-
-    Uses the busier of host load and this app's CPU-quota-normalized load, so a
-    1-vCPU hosted app throttles even if the physical host has idle cores.
-    """
-    process = psutil.Process(os.getpid())
-    cores = _allocated_cpu_cores()
-    last_time = time.monotonic()
-    try:
-        times = process.cpu_times()
-        last_used = times.user + times.system
-    except (psutil.Error, OSError):
-        last_used = 0.0
-    while True:
-        try:
-            # Only this thread calls psutil.cpu_percent. Blocking samples make
-            # the measurement meaningful and never delay WebRTC callbacks.
-            host_cpu = float(psutil.cpu_percent(interval=1.0))
-            now = time.monotonic()
-            times = process.cpu_times()
-            used = times.user + times.system
-            elapsed = max(now - last_time, 0.001)
-            proc_cpu = 100.0 * max(0.0, used - last_used) / (elapsed * cores)
-            last_used, last_time = used, now
-            ram = max(float(psutil.virtual_memory().percent),
-                      _cgroup_memory_percent())
-            ResourceGovernor._publish_pressure(
-                max(host_cpu, proc_cpu), ram, now,
-                cpu_host=host_cpu, cpu_process=proc_cpu)
-        except Exception as exc:
-            LOG.warning("Resource sampler failed: %s: %s", type(exc).__name__, exc)
-            time.sleep(1.0)
-
-
-def _start_resource_monitor_once() -> bool:
-    """Start exactly one live monitor per process, and restart it if it dies.
-
-    The cached runtime owns both the thread and the readings, so a rerun never
-    silently severs the connection between the camera governor and dashboard.
-    """
-    with _RESOURCE_SHARED["monitor_lock"]:
-        existing = _RESOURCE_SHARED["monitor_thread"]
-        if existing is not None and existing.is_alive():
-            return True
-
-        # Immediately show actual resource usage in STANDBY, rather than 0/0
-        # until the one-second background sampling interval has completed.
-        try:
-            host_cpu = float(psutil.cpu_percent(interval=0.10))
-            ram = max(float(psutil.virtual_memory().percent),
-                      _cgroup_memory_percent())
-            ResourceGovernor._publish_pressure(host_cpu, ram, time.monotonic(),
-                                                cpu_host=host_cpu)
-        except Exception as exc:
-            LOG.warning("Initial resource sample failed: %s: %s",
-                        type(exc).__name__, exc)
-
-        worker = threading.Thread(target=_resource_monitor_loop, daemon=True,
-                                  name="cybervision-resource-governor")
-        _RESOURCE_SHARED["monitor_thread"] = worker
-        worker.start()
-    return True
-
-
-def start_resource_monitor() -> None:
-    _start_resource_monitor_once()
-
-
 def draw_browser_camera_hud(frame_bgr: np.ndarray, fps: float, yolo_detected: bool,
                             inference_count: int, severity: str,
                             throttle_level: int) -> np.ndarray:
-    """Compact, directly-on-video HUD matching the original 3×3 camera tile.
+    """Draw the live HUD in WebRTC frames. Never uses Streamlit session state.
 
-    CAM_01 [LIVE]
-    FPS: <fps> | YOLO: CLEAR/DETECTED
-    INF: <count> | STATUS: <severity>
-
-    The adaptive governor stays operational, but is no longer printed over
-    the footage. No translucent rectangle is created per frame.
+    Small ROI-only alpha blend + 3 lines of text; safe for 480x360 browser
+    video. Unlike an HTML overlay, this is displayed inside the returned feed.
     """
-    if frame_bgr is None or frame_bgr.size == 0:
+    height, width = frame_bgr.shape[:2]
+    panel_w, panel_h = min(width - 4, 310), min(height - 4, 78)
+    if panel_w <= 0 or panel_h <= 0:
         return frame_bgr
-    h, w = frame_bgr.shape[:2]
-    severity = str(severity or "NORMAL").upper()
-    if severity not in SEVERITY_STYLE:
-        severity = "NORMAL"
-    color = (0, 0, 255) if severity == "CRITICAL" else (
-        (0, 140, 255) if severity == "HIGH" else
-        (0, 230, 255) if severity == "MEDIUM" else (0, 255, 0)
-    )
-    font = cv2.FONT_HERSHEY_SIMPLEX
-    lines = (
-        ("CAM_01 [LIVE]", (0, 255, 0)),
-        (f"FPS: {fps:.1f} | YOLO: {'DETECTED' if yolo_detected else 'CLEAR'}", (0, 255, 0)),
-        (f"INF: {inference_count} | STATUS: {severity}", color),
-    )
-    # Reconstruct the tiny title area before painting its single green label.
-    # Some existing frames / old 3x3 composites carry a previously stamped
-    # black CAM_01 label. Inpainting just this ROI clears any old lettering
-    # without adding a black backdrop or erasing the rest of the camera feed.
-    if h >= 35 and w >= 90:
-        right = min(w, 240)
-        region = frame_bgr[2:31, 2:right]
-        if region.shape[0] >= 27 and region.shape[1] >= 82:
-            mask = np.zeros(region.shape[:2], dtype=np.uint8)
-            mask[3:24, 4:-4] = 255
-            region[:] = cv2.inpaint(region, mask, 2, cv2.INPAINT_TELEA)
+    x0, y0 = 3, 3
+    roi = frame_bgr[y0:y0 + panel_h, x0:x0 + panel_w]
+    dim = np.zeros_like(roi)
+    cv2.addWeighted(dim, 0.60, roi, 0.40, 0, dst=roi)
+    cv2.rectangle(frame_bgr, (x0, y0), (x0 + panel_w - 1, y0 + panel_h - 1), (255, 220, 0), 1)
+    cv2.line(frame_bgr, (x0 + 2, y0 + panel_h - 3),
+             (x0 + panel_w - 3, y0 + panel_h - 3), (255, 230, 0), 1)
 
-    for row, (message, text_color) in enumerate(lines):
-        x, y = 9, 19 + row * 22
-        if y >= h:
-            break
-        # Use a single unoutlined draw. LINE_8 gives the thin camera title a
-        # clean edge without the dark antialias halo seen after WebRTC scaling.
-        font_scale = (0.42 if row == 0 else 0.50) if w >= 320 else 0.36
-        thickness = 1 if row == 0 else 2
-        cv2.putText(frame_bgr, message, (x, y), font, font_scale,
-                    text_color, thickness, cv2.LINE_8 if row == 0 else cv2.LINE_AA)
+    severity = str(severity).upper() if severity else "NORMAL"
+    sev_color = ((0, 0, 255) if severity == "CRITICAL" else
+                 (0, 175, 255) if severity == "HIGH" else
+                 (0, 255, 255) if severity == "MEDIUM" else (0, 255, 0))
+    cv2.putText(frame_bgr, f"FPS: {fps:.1f} | YOLO: {'DETECTED' if yolo_detected else 'CLEAR'}",
+                (10, 21), cv2.FONT_HERSHEY_SIMPLEX, .43, (0, 255, 0), 1, cv2.LINE_AA)
+    cv2.putText(frame_bgr, f"INF: {inference_count} | STATUS: {severity}",
+                (10, 42), cv2.FONT_HERSHEY_SIMPLEX, .43, sev_color, 1, cv2.LINE_AA)
+    throttle_name = ('NORMAL', 'MEDIUM', 'CRITICAL')[max(0, min(2, int(throttle_level)))]
+    throttle_color = ((0, 255, 0), (0, 255, 255), (0, 0, 255))[max(0, min(2, int(throttle_level)))]
+    cv2.putText(frame_bgr, f"THROTTLE: L{throttle_level} ({throttle_name})",
+                (10, 63), cv2.FONT_HERSHEY_SIMPLEX, .40, throttle_color, 1, cv2.LINE_AA)
     return frame_bgr
 
 
@@ -1539,11 +1220,12 @@ def draw_browser_camera_hud(frame_bgr: np.ndarray, fps: float, yolo_detected: bo
 # =============================================================================
 if WEBRTC_AVAILABLE:
     class BrowserCameraProcessor(VideoProcessorBase):
-        """Keep AI inference off the real-time video callback.
+        """Keep WebRTC transmission independent of expensive AI inference.
 
-        The browser sends a small 320x240 stream; each received frame gets only
-        the compact HUD and optional cached YOLO boxes. An occasional sampled
-        frame goes to the asynchronous detector, never blocking recv().
+        recv() is called for every video frame, but converts pixels only for an
+        occasional detection sample, and hands that sample to a bounded worker.
+        Frames without detection boxes are returned unmodified. This avoids
+        constant PyAV frame creation, OpenCV work and extra CPU/memory pressure.
         No Streamlit calls occur on the WebRTC worker threads.
         """
 
@@ -1583,12 +1265,6 @@ if WEBRTC_AVAILABLE:
                             self._analysis_severity = YOLOFireSmokeDetector.hazard_severity(result)
                     self._yolo_busy = False
 
-        def attach_detector(self, detector) -> None:
-            """Attach the already-loaded YOLO model after the browser stream starts."""
-            with self._lock:
-                if detector is not None and self._detector is None:
-                    self._detector = detector
-
         def set_analysis_severity(self, severity: str) -> None:
             """Called by Streamlit pipeline, not by a WebRTC worker."""
             with self._lock:
@@ -1596,10 +1272,8 @@ if WEBRTC_AVAILABLE:
 
         def recv(self, frame):
             now = time.monotonic()
-            # Independent CPU/RAM sampling lets the WebRTC worker throttle
-            # before Streamlit's resource-metrics fragment refreshes.
-            throttle_level = ResourceGovernor.poll_runtime_pressure()
-            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"] * (1, 2, 4)[throttle_level]
+            # Apply adaptive sampling, not just YOLO throttling, when CPU/RAM is high.
+            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"] * (1, 2, 4)[ResourceGovernor.level()]
             with self._lock:
                 previous = self._last_tick
                 self._last_tick = now
@@ -1620,7 +1294,7 @@ if WEBRTC_AVAILABLE:
             sample = None
             if needs_sample:
                 try:
-                    # Copy a detection/analysis sample no more than 2.5 times/s at L0.
+                    # Decode to ndarray only 4 times/s, not for every WebRTC frame.
                     sample = frame.to_ndarray(format="bgr24")
                 except Exception as exc:
                     sample = None
@@ -1654,18 +1328,15 @@ if WEBRTC_AVAILABLE:
                             self._yolo_busy = False
                         LOG.warning("YOLO background thread unavailable: %s", exc)
 
-            # Always render the compact three-line HUD, including between YOLO
-            # detections. 320x240 greatly reduces the per-frame encode cost;
-            # a rendering error still passes through the original frame.
+            # Always render the status HUD, including between YOLO detections.
+            # This is a lightweight 480x360 frame conversion; YOLO itself remains
+            # on the bounded background worker and the WebRTC frame is still sent
+            # if a render error occurs.
             try:
-                # Decoding is required for a HUD embedded in a SENDRECV video.
-                # The smaller capture avoids repeated 480x360 frame transformations.
-                # On sampled frames, the async model may still be reading sample;
-                # copy once to keep the model input immutable.
-                out = sample.copy() if sample is not None else frame.to_ndarray(format="bgr24")
+                img = sample if sample is not None else frame.to_ndarray(format="bgr24")
+                out = img.copy()  # sampled image also belongs to asynchronous YOLO
                 if yolo and yolo.get("detections"):
-                    # Draw directly to the output array instead of making another copy.
-                    YOLOFireSmokeDetector.draw_boxes_in_place(out, yolo)
+                    out = YOLOFireSmokeDetector.draw_boxes_on_frame(out, yolo)
                 out = draw_browser_camera_hud(
                     out, self._fps, bool(yolo and yolo.get("detected")),
                     inference_count, hud_severity, ResourceGovernor.level()
@@ -1719,12 +1390,12 @@ else:
 
 
 def _get_browser_processor():
-    """Return the processor for the currently playing browser WebRTC context."""
-    ctx = st.session_state.get("webrtc_ctx")
-    if ctx is None or not bool(getattr(getattr(ctx, "state", None), "playing", False)):
-        return None
-    # Never return a processor retained from an old, stopped connection.
-    return getattr(ctx, "video_processor", None)
+    """Find the live processor (the factory records it in a per-session dict)."""
+    processor = (st.session_state.get("_cam_holder") or {}).get("proc")
+    if processor is None:
+        ctx = st.session_state.get("webrtc_ctx")
+        processor = getattr(ctx, "video_processor", None)
+    return processor
 
 
 def _get_secret(name: str) -> Optional[str]:
@@ -1753,22 +1424,14 @@ def _get_metered_credentials() -> Tuple[Optional[str], Optional[str]]:
 # GOOGLE CLOUD CREDENTIALS
 # =============================================================================
 def _get_gcp_service_account_info() -> Optional[dict]:
-    """Read a *service account*, not the Google OAuth login client in [auth.google].
-
-    Supports GCP_SERVICE_ACCOUNT_JSON (JSON string or TOML inline table),
-    [gcp_service_account], [GCP_SERVICE_ACCOUNT], [service_account], and
-    common alternative names. Do not log or display service-account keys.
-    """
     raw = _get_secret("GCP_SERVICE_ACCOUNT_JSON")
     if raw:
         try:
-            value = json.loads(raw) if isinstance(raw, str) else dict(raw)
-            if isinstance(value, dict):
-                return _normalize_service_account(value)
-        except (ValueError, TypeError) as exc:
-            _update_cloud_status(False,
-                f"GCP_SERVICE_ACCOUNT_JSON is not valid JSON/table: {type(exc).__name__}")
-            return None
+            info = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            if isinstance(info, dict):
+                return _normalize_service_account(info)
+        except (ValueError, TypeError):
+            pass
     try:
         for key in ("gcp_service_account", "GCP_SERVICE_ACCOUNT", "service_account",
                     "google_service_account", "google_cloud_service_account", "gcp"):
@@ -1777,23 +1440,19 @@ def _get_gcp_service_account_info() -> Optional[dict]:
                 if isinstance(info, str):
                     info = json.loads(info)
                 return _normalize_service_account(dict(info))
-        # Flat service account TOML fields are supported too.
+        # Flat TOML service account fields are also supported.
         if "private_key" in st.secrets and "client_email" in st.secrets:
             return _normalize_service_account(dict(st.secrets))
     except Exception as exc:
-        _update_cloud_status(False,
-            f"Cannot parse GCP service account section: {type(exc).__name__}")
-        return None
+        LOG.warning("Cannot parse GCP secret structure: %s", type(exc).__name__)
 
-    # Optional local-dev fallback; never commit the JSON file to a public repo.
     local_key_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "service_account.json")
     if os.path.isfile(local_key_path):
         try:
             with open(local_key_path, encoding="utf-8") as keyfile:
                 return _normalize_service_account(json.load(keyfile))
         except Exception as exc:
-            _update_cloud_status(False,
-                f"Cannot read local service account file: {type(exc).__name__}")
+            LOG.warning("Could not load service_account.json: %s", type(exc).__name__)
     return None
 
 
@@ -1805,106 +1464,35 @@ def _normalize_service_account(info: dict) -> dict:
     return result
 
 
+@st.cache_resource(show_spinner=False)
 def get_gcp_clients() -> Tuple[Optional[Any], Optional[Any]]:
-    """Initialize Storage and Firestore independently with deployment credentials.
-
-    This function runs only on the Streamlit script thread. Worker threads use
-    the clients already shared through CLOUD_CLIENTS. Failed initialization is
-    logged, never silently mistaken for an offline Wi-Fi connection.
-    """
-    gcs, db = get_cloud_runtime_clients()
-    if gcs is not None and db is not None:
-        return gcs, db
-
-    credentials = None
-    project = None
+    if not GCP_AVAILABLE:
+        return None, None
     try:
         info = _get_gcp_service_account_info()
-        if info is not None:
-            if not GOOGLE_AUTH_AVAILABLE:
-                raise RuntimeError("google-auth is not installed")
-            required = ("client_email", "private_key", "token_uri")
-            missing = [key for key in required if not info.get(key)]
-            if missing:
-                raise ValueError("Cloud service account is missing: " + ", ".join(missing))
-            credentials = gcp_service_account.Credentials.from_service_account_info(info)
-            project = info.get("project_id") or _get_secret("GCP_PROJECT_ID")
-        else:
-            # Preserve localhost compatibility: google.auth.default() also
-            # discovers credentials created by `gcloud auth application-default
-            # login`, even if GOOGLE_APPLICATION_CREDENTIALS is unset. On a
-            # hosted app the same call succeeds only when valid ADC actually
-            # exists (for example workload identity or an environment key).
-            import google.auth
-            try:
-                credentials, detected_project = google.auth.default(
-                    scopes=["https://www.googleapis.com/auth/cloud-platform"])
-            except google.auth.exceptions.DefaultCredentialsError as exc:
-                raise RuntimeError(
-                    "No Google Cloud application credentials available. "
-                    "Google OAuth login in [auth.google] cannot authorize "
-                    "Firestore or Cloud Storage uploads."
-                ) from exc
-            project = _get_secret("GCP_PROJECT_ID") or detected_project
-        if not project:
-            raise ValueError("Google Cloud project_id is required")
+        if not info:
+            _update_cloud_status(False, "No service account found in Streamlit secrets.")
+            return None, None
+        credentials = gcp_service_account.Credentials.from_service_account_info(info)
+        # Honor deployment secrets rather than a hardcoded localhost project.
+        project = info.get("project_id") or _get_secret("GCP_PROJECT_ID") or CONFIG["GCP_PROJECT_ID"]
+        return (storage.Client(credentials=credentials, project=project),
+                firestore.Client(credentials=credentials, project=project))
     except Exception as exc:
-        _update_cloud_status(False, f"Google Cloud authentication: {type(exc).__name__}: {exc}")
-        return gcs, db
-
-    # Persist resolved auth with the daemon worker. No secret contents logged.
-    with CLOUD_CLIENTS_LOCK:
-        _CLOUD_SHARED["auth"].update(project=project, credentials=credentials)
-
-    if gcs is None:
-        if not GCS_AVAILABLE:
-            _update_cloud_status(False, "google-cloud-storage is missing", service="storage")
-        else:
-            try:
-                gcs = storage.Client(credentials=credentials, project=project)
-            except Exception as exc:
-                _update_cloud_status(False, f"Storage client: {type(exc).__name__}: {exc}", service="storage")
-    if db is None:
-        if not FIRESTORE_AVAILABLE:
-            _update_cloud_status(False, "google-cloud-firestore is missing", service="firestore")
-        else:
-            try:
-                db = firestore.Client(credentials=credentials, project=project)
-            except Exception as exc:
-                _update_cloud_status(False, f"Firestore client: {type(exc).__name__}: {exc}", service="firestore")
-
-    with CLOUD_CLIENTS_LOCK:
-        CLOUD_CLIENTS.update(storage=gcs, firestore=db)
-    return gcs, db
+        _update_cloud_status(False, f"GCP credentials/client: {type(exc).__name__}: {exc}")
+        return None, None
 
 
 def get_cloud_bucket_name() -> str:
-    """Read the bucket shared across Streamlit reruns and the daemon worker."""
-    with CLOUD_CLIENTS_LOCK:
-        return str(_CLOUD_SHARED.get("bucket_name") or CONFIG["GCP_BUCKET"]).strip()
+    # CONFIG is initialized on the main Streamlit thread before background sync.
+    return str(CONFIG["GCP_BUCKET"]).strip()
 
 
 def configure_cloud_from_secrets() -> None:
-    """Load cloud settings only on Streamlit's script thread.
-
-    Bucket may be at TOML root or alongside credentials in [gcp_service_account],
-    so users can append a complete table after their existing [auth.google].
-    """
+    """Read Streamlit secrets only on the main script thread."""
     bucket = _get_secret("GCP_BUCKET") or _get_secret("GCS_BUCKET")
-    if not bucket:
-        try:
-            for table_name in ("gcp_service_account", "GCP_SERVICE_ACCOUNT", "gcp"):
-                table = st.secrets.get(table_name)
-                if table:
-                    bucket = table.get("bucket") or table.get("gcp_bucket")
-                    if bucket:
-                        break
-        except Exception:
-            pass
     if bucket:
         CONFIG["GCP_BUCKET"] = str(bucket).strip()
-    with CLOUD_CLIENTS_LOCK:
-        _CLOUD_SHARED["bucket_name"] = str(CONFIG["GCP_BUCKET"]).strip()
 
 STUN_ONLY_ICE_SERVERS = [{"urls": ["stun:stun.l.google.com:19302"]}]
 ICE_SERVER_DIAGNOSTICS: Dict[str, str] = {"tier": "unknown", "detail": ""}
@@ -2060,38 +1648,33 @@ def render_browser_camera_widget() -> None:
         return proc
 
     with st.container(key="webrtc_transport"):
-        try:
-            ctx = webrtc_streamer(
-                key=f"cybervision-browser-camera-v3-{st.session_state.get('webrtc_connection_id', 0)}",
-                mode=WebRtcMode.SENDRECV,
-                desired_playing_state=True,
-                rtc_configuration={"iceServers": ice_servers},
-                media_stream_constraints={
-                    "video": {
-                        "width": {"ideal": 480, "max": 480},
-                        "height": {"ideal": 360, "max": 360},
-                        "frameRate": {"ideal": 12, "max": 15},
-                    },
-                    "audio": False,
+        ctx = webrtc_streamer(
+            key=f"cybervision-browser-camera-v3-{st.session_state.get('webrtc_connection_id', 0)}",
+            mode=WebRtcMode.SENDRECV,
+            desired_playing_state=True,
+            rtc_configuration={"iceServers": ice_servers},
+            media_stream_constraints={
+                "video": {
+                    "width": {"ideal": 480, "max": 480},
+                    "height": {"ideal": 360, "max": 360},
+                    "frameRate": {"ideal": 12, "max": 15},
                 },
-                video_processor_factory=_processor_factory,
-                video_html_attrs={
-                    "autoPlay": True,
-                    "controls": False,
-                    "muted": True,
-                    "playsInline": True,
-                    "style": {
-                        "width": "100%",
-                        "maxWidth": "100%",
-                        "borderRadius": "14px",
-                    },
+                "audio": False,
+            },
+            video_processor_factory=_processor_factory,
+            video_html_attrs={
+                "autoPlay": True,
+                "controls": False,
+                "muted": True,
+                "playsInline": True,
+                "style": {
+                    "width": "100%",
+                    "maxWidth": "100%",
+                    "borderRadius": "14px",
                 },
-                async_processing=True,
-            )
-        except Exception as exc:
-            LOG.exception("WebRTC camera player failed to mount: %s", exc)
-            st.error(f"Web camera could not initialize: {type(exc).__name__}: {exc}")
-            return
+            },
+            async_processing=True,
+        )
 
     st.session_state.webrtc_ctx = ctx
 
@@ -2107,6 +1690,11 @@ def render_browser_camera_widget() -> None:
             icon=":material/warning:",
         )
 
+
+# =============================================================================
+# LOCAL CAMERA HANDLING & 3x3 MATRIX (localhost behaviour of the working project)
+# =============================================================================
+@st.cache_resource(show_spinner=False)
 def _get_camera_read_executor(n_workers: int) -> ThreadPoolExecutor:
     return ThreadPoolExecutor(max_workers=max(1, n_workers))
 
@@ -2178,9 +1766,8 @@ def construct_3x3_grid(active_frames: Dict[int, np.ndarray], tile_w: int = 320, 
         cam_key = f"CAM_{idx+1:02d}"
         if idx in active_frames and active_frames[idx] is not None:
             tile = cv2.resize(active_frames[idx], (tile_w, tile_h))
-            if idx != 0:  # primary tile's camera title is drawn with the live HUD
-                cv2.putText(tile, f"{cam_key} [LIVE]", (10, 20),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
+            cv2.putText(tile, f"{cam_key} [LIVE]", (10, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1)
             cv2.rectangle(tile, (0, 0), (tile_w - 1, tile_h - 1), (0, 255, 0), 1)
         else:
             tile = get_cached_blank_tile(tile_w, tile_h, f"{cam_key}: NO CAMERA DETECTED")
@@ -2462,13 +2049,8 @@ class YOLOFireSmokeDetector:
     def draw_boxes_on_frame(frame: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
         if not yolo_result or not yolo_result.get("detections"):
             return frame
-        return YOLOFireSmokeDetector.draw_boxes_in_place(frame.copy(), yolo_result)
 
-    @staticmethod
-    def draw_boxes_in_place(annotated: np.ndarray, yolo_result: Dict[str, Any]) -> np.ndarray:
-        """Fast renderer for writable frames that are not shared with the YOLO worker."""
-        if not yolo_result or not yolo_result.get("detections"):
-            return annotated
+        annotated = frame.copy()
         for det in yolo_result["detections"]:
             x1, y1, x2, y2 = det["box"]
             label = f"{det['class']} {det['confidence']:.0%}"
@@ -2538,14 +2120,11 @@ class VisualFireSmokeDetector:
         fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_OPEN, kernel)
         fire_mask = cv2.morphologyEx(fire_mask, cv2.MORPH_DILATE, kernel)
 
-        # Restored to the working localhost color/brightness thresholds.
-        # These figures are kept only as auxiliary detection statistics until
-        # visual-only alerts are explicitly re-enabled.
         low_saturation = s < 35
         mid_brightness = (v > 110) & (v < 200)
         gray_dominance = (
-            (np.abs(r.astype(np.int16) - g.astype(np.int16)) < 18)
-            & (np.abs(g.astype(np.int16) - b.astype(np.int16)) < 18)
+            (np.abs(r.astype(int) - g.astype(int)) < 18)
+            & (np.abs(g.astype(int) - b.astype(int)) < 18)
         )
 
         smoke_pixels = low_saturation & mid_brightness & gray_dominance
@@ -2558,7 +2137,7 @@ class VisualFireSmokeDetector:
                 cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY),
                 cv2.cvtColor(previous_frame, cv2.COLOR_BGR2GRAY),
             )
-            moving_smoke = (diff > 10) & smoke_pixels
+            moving_smoke = (diff > 12) & smoke_pixels
             smoke_motion_ratio = float(np.count_nonzero(moving_smoke)) / max(1, frame.shape[0] * frame.shape[1])
 
         total_pixels = frame.shape[0] * frame.shape[1]
@@ -2592,7 +2171,7 @@ class VisualFireSmokeDetector:
         elif smoke_ratio >= 0.20:
             severity = "HIGH"
             keyword = "visual_smoke_high"
-        elif smoke_ratio >= CONFIG["VISUAL_SMOKE_MIN_RATIO"]:
+        elif smoke_ratio >= 0.10:
             severity = "MEDIUM"
             keyword = "visual_smoke_medium"
         else:
@@ -2824,9 +2403,9 @@ def flush_pending_cloud_uploads(client=None) -> None:
                 meta_bytes = f.read()
             # Stable object keys + retry-safe overwrites.
             bucket.blob(f"cybervision_alerts/{event_uuid}.jpg").upload_from_string(
-                image_bytes, content_type="image/jpeg", timeout=CONFIG["CLOUD_WRITE_TIMEOUT_SEC"])
+                image_bytes, content_type="image/jpeg", timeout=20)
             bucket.blob(f"cybervision_alerts/{event_uuid}.json").upload_from_string(
-                meta_bytes, content_type="application/json", timeout=CONFIG["CLOUD_WRITE_TIMEOUT_SEC"])
+                meta_bytes, content_type="application/json", timeout=20)
             os.remove(image_path)
             os.remove(meta_path)
             _update_cloud_status(True, "Storage image and metadata uploaded", service="storage")
@@ -2838,25 +2417,22 @@ def flush_pending_cloud_uploads(client=None) -> None:
 
 def upload_to_google_cloud_async(frame: np.ndarray, alert: Dict[str, Any],
                                  cloud_sync_enabled: bool) -> None:
-    """Durably queue a confirmed hazard; retry even after temporary auth failures."""
     event_uuid = uuid.uuid4().hex
     event = {**alert, "event_id": event_uuid, "camera_id": "CAM_01"}
+    # Always save local event. When cloud is off it must not later sync on its own.
     try:
         save_event_locally(time.time(), event.get("severity", "UNKNOWN"),
                            event.get("description", ""), event_uuid=event_uuid,
-                           cloud_enabled=True)
+                           cloud_enabled=cloud_sync_enabled)
     except Exception as exc:
         _update_cloud_status(False, f"SQLite event queue: {type(exc).__name__}: {exc}")
-    # Queue image *even when credentials are not configured yet*. Previously
-    # "cloud_sync_enabled=False" lost the image and marked the event synced.
+    if not cloud_sync_enabled:
+        _update_cloud_status(False, "Cloud upload is disabled: credentials or Google Cloud SDK not ready.")
+        return
     if not _queue_image_for_later_upload(frame, event):
         return
-    gcs, db = get_cloud_runtime_clients()
-    if gcs is None and db is None:
-        LOG.warning("Cloud clients unavailable; event %s retained for automatic retry", event_uuid)
-        return
-    threading.Thread(target=sync_cloud_once, daemon=True,
-                     name="cybervision-upload").start()
+    # The global lock keeps an upload burst from creating concurrent flushes.
+    threading.Thread(target=sync_cloud_once, daemon=True, name="cybervision-upload").start()
 
 # =============================================================================
 # HELPER FUNCTIONS
@@ -2880,8 +2456,8 @@ def resolve_hazard(yolo_result: Dict[str, Any], verdict: Dict[str, Any],
                    snapshot: bool = False) -> Tuple[str, str, float, str]:
     """Return (severity, type, confidence, source).
 
-    YOLO is primary. At the localhost-compatible default, visual HSV statistics
-    do not themselves trigger alerts. Optional visual fallback needs two samples.
+    YOLO is primary. Visual HSV heuristics are a fallback requiring 2 samples
+    for live scenes, to reduce alerts from stationary gray backgrounds.
     """
     detections = yolo_result.get("detections", [])
     yolo_items = []
@@ -2898,12 +2474,6 @@ def resolve_hazard(yolo_result: Dict[str, Any], verdict: Dict[str, Any],
         _, confidence, hazard_type, severity = max(yolo_items)
         return severity, hazard_type, confidence, "YOLO_DETECTOR"
 
-    # The original localhost program alerted on YOLO detections, not on
-    # color-only segmentation. Keep the segmentation as telemetry by default;
-    # this prevents gray walls/lighting from causing smoke alarms.
-    if not CONFIG.get("ENABLE_VISUAL_ALERT_FALLBACK", False):
-        return "NORMAL", "", 0.0, "SYSTEM"
-
     visual_sev = verdict.get("visual_severity", "NORMAL")
     visual_type = str(verdict.get("visual_keyword", verdict.get("matched_keyword", ""))).lower()
     if visual_sev != "NORMAL":
@@ -2912,7 +2482,7 @@ def resolve_hazard(yolo_result: Dict[str, Any], verdict: Dict[str, Any],
         confirmed = snapshot or (fire_streak >= 2 if is_fire else smoke_streak >= 2)
         if is_smoke and not snapshot:
             # Avoid treating unmoving gray scenery as smoke in a live video.
-            confirmed = confirmed and float(verdict.get("smoke_motion_ratio", 0.0)) >= CONFIG["VISUAL_SMOKE_MOTION_MIN_RATIO"]
+            confirmed = confirmed and float(verdict.get("smoke_motion_ratio", 0.0)) >= 0.012
         if confirmed and (is_fire or is_smoke):
             return visual_sev, "FIRE" if is_fire else "SMOKE", float(verdict.get("confidence", 0.0)), "OPENCV_VISUAL_FALLBACK"
     return "NORMAL", "", 0.0, "SYSTEM"
@@ -2989,8 +2559,7 @@ def run_detection_pipeline(
     else:
         run_yolo_now = (
             st.session_state.get("yolo_detection") is None
-            or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"] *
-                                    (1, 2, 3)[ResourceGovernor.level()]) == 0
+            or frame_number % max(1, CONFIG["YOLO_EVERY_N_FRAMES"]) == 0
         )
 
         if run_yolo_now:
@@ -3004,7 +2573,6 @@ def run_detection_pipeline(
 
     run_visual_now = (
         sync
-        # Browser uses the same periodic visual analysis as localhost.
         or st.session_state.get("last_visual_result") is None
         or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"] *
                                (1 + ResourceGovernor.level())) == 0
@@ -3026,13 +2594,9 @@ def run_detection_pipeline(
         st.session_state.visual_fire_streak = (
             st.session_state.get("visual_fire_streak", 0) + 1 if "fire" in visual_keyword else 0
         )
-    candidate_hazard = bool(yolo_result.get("detected")) or (
-        CONFIG.get("ENABLE_VISUAL_ALERT_FALLBACK", False)
-        and visual_result.get("visual_severity") != "NORMAL"
-    )
+    candidate_hazard = bool(yolo_result.get("detected")) or visual_result.get("visual_severity") != "NORMAL"
     analyze_this_frame = candidate_hazard and (
-        sync or frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"] *
-                                    (1, 2, 3)[ResourceGovernor.level()]) == 0
+        sync or frame_number % max(1, CONFIG["ANALYZE_EVERY_N_FRAMES"]) == 0
     )
 
     if analyze_this_frame:
@@ -3200,21 +2764,6 @@ def render_sidebar_nav() -> None:
 
         cam_running = st.session_state.camera_running
         wifi_online = is_wifi_connected()
-        pending_events, pending_images = pending_cloud_counts()
-        with CLOUD_STATUS_LOCK:
-            cloud_status = dict(CLOUD_STATUS)
-        if pending_events or pending_images:
-            sync_label = f"Cloud pending ({pending_events} events, {pending_images} images)"
-            sync_color = "#ffd60a"
-        elif cloud_status.get("storage_success") and cloud_status.get("firestore_success"):
-            sync_label = "Data synced to cloud"
-            sync_color = "#30d158"
-        elif cloud_status.get("last_error"):
-            sync_label = "Cloud unavailable — check server logs"
-            sync_color = "#ff9500"
-        else:
-            sync_label = "Cloud ready for events"
-            sync_color = "#ffd60a"
 
         st.markdown(
             f"""
@@ -3226,10 +2775,6 @@ def render_sidebar_nav() -> None:
                 <div class="status-row">
                     <span class="status-dot" style="background:{'#30d158' if wifi_online else '#ffd60a'};"></span>
                     Network {"online" if wifi_online else "offline"}
-                </div>
-                <div class="status-row">
-                    <span class="status-dot" style="background:{sync_color};"></span>
-                    {sync_label}
                 </div>
             </div>
             """,
@@ -3293,8 +2838,64 @@ def render_dashboard_settings_panel() -> None:
             value=st.session_state.sound_enabled,
         )
 
-        # Cloud backup is automatic and configured in Streamlit secrets. Keep
-        # diagnostics in server logs, not the Server Setup UI.
+        # Cloud backup was previously hidden behind a disabled toggle, making
+        # failures impossible to diagnose. Keep it automatic and show status.
+        cloud_ready = bool(st.session_state.get("cloud_sync_enabled"))
+        with CLOUD_STATUS_LOCK:
+            cloud_status = dict(CLOUD_STATUS)
+        event_count, image_count = pending_cloud_counts()
+        if cloud_ready:
+            st.caption(f"Cloud backup: configured · queued {event_count} event(s), {image_count} image(s)")
+        else:
+            st.warning("Cloud backup: not connected. Open diagnostics below to test configuration.")
+        if cloud_status.get("last_error"):
+            st.warning("Cloud sync: " + cloud_status["last_error"])
+
+        with st.expander("Cloud backup diagnostics", expanded=not cloud_ready):
+            if not GCP_AVAILABLE:
+                st.error("Google Cloud SDK packages are missing from the deployment.")
+            elif not _get_gcp_service_account_info():
+                st.error("Service account not found. Check the Streamlit Cloud Secrets TOML.")
+            else:
+                st.caption("Service account found. Actual write permissions require testing.")
+            st.caption(f"Storage bucket: `{get_cloud_bucket_name()}`")
+            st.caption(f"Pending: {event_count} Firestore event(s), {image_count} Storage image(s)")
+            if cloud_status.get("firestore_success"):
+                st.caption("Firestore: " + cloud_status["firestore_success"])
+            if cloud_status.get("storage_success"):
+                st.caption("Storage: " + cloud_status["storage_success"])
+            if st.button("Test Google Cloud", key="test_gcp_button"):
+                gcs_client, db_client = get_cloud_runtime_clients()
+                if gcs_client is None or db_client is None:
+                    st.error("Cloud clients unavailable. Check deployment packages and service account.")
+                else:
+                    marker_id = "test_" + uuid.uuid4().hex
+                    bucket = gcs_client.bucket(get_cloud_bucket_name())
+                    blob = bucket.blob("cybervision_diagnostics/" + marker_id + ".json")
+                    doc = db_client.collection("cybervision_diagnostics").document(marker_id)
+                    try:
+                        blob.upload_from_string('{"test":true}', content_type="application/json", timeout=20)
+                        _update_cloud_status(True, "Storage diagnostic write succeeded", service="storage")
+                        st.success("Storage write succeeded")
+                    except Exception as exc:
+                        _update_cloud_status(False, f"Storage test: {type(exc).__name__}: {exc}", service="storage")
+                        st.error(f"Storage write FAILED: {type(exc).__name__}: {exc}")
+                    try:
+                        doc.set({"test": True, "timestamp": firestore.SERVER_TIMESTAMP}, timeout=20)
+                        _update_cloud_status(True, "Firestore diagnostic write succeeded", service="firestore")
+                        st.success("Firestore write succeeded")
+                    except Exception as exc:
+                        _update_cloud_status(False, f"Firestore test: {type(exc).__name__}: {exc}", service="firestore")
+                        st.error(f"Firestore write FAILED: {type(exc).__name__}: {exc}")
+                    # Cleanup is optional: object creator roles may not allow delete.
+                    try:
+                        blob.delete(timeout=10)
+                        doc.delete()
+                    except Exception:
+                        pass
+            if st.button("Retry queued uploads", key="cloud_retry_button"):
+                threading.Thread(target=sync_cloud_once, daemon=True, name="cybervision-retry").start()
+                st.info("Sync requested; refresh the page to see updated status.")
 
         timeout_option = st.selectbox(
             "Inference timeout target",
@@ -3312,7 +2913,10 @@ def _render_resource_metrics_body() -> None:
     st.markdown("<div class='stats-panel-title'>Resources</div>", unsafe_allow_html=True)
 
     metrics = SystemMonitor.get_metrics()
-    # The resource monitor owns the governor. UI merely reads its values.
+    # Update the global governor here too, including when pipeline ticks are
+    # being skipped under pressure. This propagates to video worker threads.
+    if st.session_state.get("camera_running", False):
+        ResourceGovernor.update_from_metrics(metrics)
     cpu_class = _metric_status_class(metrics["cpu"])
     ram_class = _metric_status_class(metrics["ram"])
     cpu_delta = _metric_delta_icon(metrics["cpu"])
@@ -3335,18 +2939,16 @@ def _render_resource_metrics_body() -> None:
     if st.session_state.last_error:
         st.info("Model/YARA backend notice: Active fallback running.")
 
-    if not YOLO_AVAILABLE or not os.path.isfile(CONFIG["YOLO_MODEL_PATH"]):
+    if not is_yolo_model_available():
         with st.expander(":material/error: YOLO not active — details", expanded=True):
-            st.text(f"Ultralytics import: {YOLO_AVAILABLE}")
-            st.text(f"Model file available: {os.path.isfile(CONFIG['YOLO_MODEL_PATH'])}")
-            if YOLO_IMPORT_ERROR:
-                st.text(YOLO_IMPORT_ERROR)
+            for label, value in get_yolo_debug_info().items():
+                st.text(f"{label}: {value}")
 
 
 def render_resource_metrics_panel() -> None:
-    # Keep CPU / RAM visible in STANDBY as well as during a live camera stream.
-    # This fragment does not remount the camera or the Start/Stop buttons.
-    st.fragment(_render_resource_metrics_body, run_every=3.0)()
+    # Fragments refresh metrics without remounting WebRTC or the setup controls.
+    refresh = 3.0 if st.session_state.get("camera_running", False) else None
+    st.fragment(_render_resource_metrics_body, run_every=refresh)()
 
 
 # DASHBOARD FUNCTIONS RESTORED AFTER SERVER SETUP REFACTOR
@@ -3357,32 +2959,16 @@ def _browser_snapshot_mode() -> bool:
     )
 
 
-def _render_dashboard_header_body() -> None:
-    cam_running = bool(st.session_state.get("camera_running")) or _browser_snapshot_mode()
-    # Don't load the model on every standby/header refresh; camera startup first.
-    yolo_ready = bool(getattr(st.session_state.get("yolo_detector"), "available", False))
+def render_dashboard_header() -> None:
+    cam_running = st.session_state.camera_running or _browser_snapshot_mode()
+    yolo_ready = is_yolo_model_available()
 
-    if not cam_running:
-        pill_text, pill_color = "STANDBY", "#6b7280"
-    elif st.session_state.get("use_webrtc"):
-        processor = _get_browser_processor()
-        health = processor.health() if processor is not None else {}
-        age = health.get("age_sec")
-        receiving = (health.get("frames_received", 0) > 0
-                     and not health.get("ended", False)
-                     and age is not None
-                     and age < CONFIG["WEBRTC_FRAME_MAX_AGE_SEC"])
-        if receiving:
-            pill_text, pill_color = (("YOLO ACTIVE", "#16a34a") if yolo_ready
-                                     else ("FALLBACK MODE", "#ca8a04"))
-        elif processor is not None and health.get("frames_received", 0) > 0:
-            pill_text, pill_color = "RECONNECTING", "#ca8a04"
-        else:
-            pill_text, pill_color = "CONNECTING", "#ca8a04"
-    elif yolo_ready:
+    if cam_running and yolo_ready:
         pill_text, pill_color = "YOLO ACTIVE", "#16a34a"
-    else:
+    elif cam_running:
         pill_text, pill_color = "FALLBACK MODE", "#ca8a04"
+    else:
+        pill_text, pill_color = "STANDBY", "#6b7280"
 
     st.markdown(
         f"""
@@ -3399,12 +2985,6 @@ def _render_dashboard_header_body() -> None:
         """,
         unsafe_allow_html=True,
     )
-
-
-def render_dashboard_header() -> None:
-    # Status updates as camera connectivity changes without restarting WebRTC.
-    refresh = 2.0 if st.session_state.get("camera_running", False) else None
-    st.fragment(_render_dashboard_header_body, run_every=refresh)()
 
 
 def _render_live_stats_body() -> None:
@@ -3474,18 +3054,13 @@ def render_video_status_bar() -> None:
     st.fragment(_render_video_status_bar_body, run_every=refresh)()
 
 
-def _render_resource_trend_preview_body() -> None:
+def render_resource_trend_preview() -> None:
     metrics_df = pd.DataFrame(list(st.session_state.metrics_history))
     if metrics_df.empty:
         st.info("No resource metrics yet.")
         return
     metrics_df = metrics_df.set_index("time")
     st.line_chart(metrics_df[["cpu", "ram"]], height=180)
-
-
-def render_resource_trend_preview() -> None:
-    # Resource data continues changing when detection is paused.
-    st.fragment(_render_resource_trend_preview_body, run_every=5.0)()
 
 
 # =============================================================================
@@ -3506,7 +3081,7 @@ def live_camera_fragment() -> None:
         st.fragment(_live_webrtc_body, run_every=CONFIG["WEBRTC_TICK_SEC"])()
     else:
         # Local webcam: the exact flow of the working localhost project.
-        st.fragment(_live_local_camera_body, run_every=0.18)()
+        st.fragment(_live_local_camera_body, run_every=0.1)()
 
 
 def _connection_help_text() -> str:
@@ -3530,8 +3105,8 @@ def _connection_help_text() -> str:
         "Camera stream stalled: " + stage + ". "
         f"Relay setup: {tier}{' - ' + detail if detail else ''}. "
         "A TURN credential response does not guarantee that WebRTC media remains connected. "
-        "Use the dashboard Stop and Start buttons to reconnect. If it persists, "
-        "check Streamlit logs, network stability and available CPU."
+        "Press Reconnect Camera. If it persists, check Streamlit logs, network stability "
+        "and available CPU; then allow camera access again if prompted."
     )
 
 
@@ -3548,8 +3123,6 @@ def _live_webrtc_body() -> None:
     status_slot = st.empty()
     render_custom_hazard_toast()
 
-    # During WebRTC negotiation ctx.state.playing is usually False. That is
-    # NOT a Stop request. Keep the player mounted until the user presses Stop.
     if not st.session_state.get("camera_running", False):
         return
 
@@ -3568,13 +3141,23 @@ def _live_webrtc_body() -> None:
         if frame is None:
             st.session_state.fps = 0.0
             waited = time.time() - (st.session_state.get("camera_started_at") or time.time())
-            if waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
-                status_slot.warning(
-                    _connection_help_text() + " Use the dashboard Stop and Start buttons to retry.",
-                    icon=":material/warning:",
-                )
+            health = processor.health() if processor is not None else {}
+            last_age = health.get("age_sec")
+            stalled = bool(health.get("ended")) or (
+                last_age is not None and last_age >= CONFIG["WEBRTC_STALL_WARNING_SEC"]
+            )
+            if stalled or waited >= CONFIG["CAMERA_CONNECT_HINT_SEC"]:
+                status_slot.warning(_connection_help_text(), icon=":material/warning:")
+                if st.button("Reconnect Camera", key="reconnect_browser_camera", type="primary"):
+                    st.session_state.webrtc_connection_id += 1
+                    st.session_state.get("_cam_holder", {}).clear()
+                    st.session_state.webrtc_ctx = None
+                    st.session_state.camera_started_at = time.time()
+                    st.session_state.last_pipeline_ts = 0.0
+                    st.session_state.fps = 0.0
+                    st.rerun()
             else:
-                status_slot.info("Connecting to your browser camera…")
+                status_slot.info("Connecting to browser camera…")
             return
 
         status_slot.empty()
@@ -3598,9 +3181,6 @@ def _live_webrtc_body() -> None:
         # needs the detections/severity, not the pixels.
         run_detection_pipeline(small, yolo_override=yolo or dict(EMPTY_YOLO_RESULT))
         if processor is not None:
-            # run_detection_pipeline has initialized YOLO on this script thread;
-            # the WebRTC worker can now use it without blocking browser startup.
-            processor.attach_detector(st.session_state.get("yolo_detector"))
             processor.set_analysis_severity(st.session_state.get("yolo_severity", "NORMAL"))
             # WebRTC YOLO worker is the inference producer; the Streamlit-side
             # counter otherwise stays 0 even while detections occur.
@@ -3657,32 +3237,26 @@ def _live_local_camera_body() -> None:
         st.session_state.last_frame_time = current_time
         st.session_state.frames_processed += 1
 
-        # Camera refresh must not wait for expensive AI/visual analysis on
-        # every Streamlit fragment rerun; schedule the pipeline independently.
-        last_pipeline = st.session_state.get("last_local_pipeline_ts", 0.0)
-        pressure = ResourceGovernor.poll_runtime_pressure()
-        analysis_interval = CONFIG["LOCAL_PIPELINE_INTERVAL_SEC"] * (1, 1.6, 3.0)[pressure]
-        if current_time - last_pipeline >= analysis_interval:
-            st.session_state.last_local_pipeline_ts = current_time
-            pipeline_result = run_detection_pipeline(primary_frame)
-            yolo_result = pipeline_result.get("yolo", {})
-            st.session_state.last_local_yolo_result = yolo_result
-        else:
-            yolo_result = st.session_state.get("last_local_yolo_result") or dict(EMPTY_YOLO_RESULT)
-            # Drain completed YOLO worker results without invoking analysis.
-            YOLOFireSmokeDetector.drain_worker_queue()
-            if st.session_state.get("yolo_detection") is not None:
-                yolo_result = st.session_state.yolo_detection
-                st.session_state.last_local_yolo_result = yolo_result
+        pipeline_result = run_detection_pipeline(primary_frame)
+        yolo_result = pipeline_result.get("yolo", {})
 
         if 0 in active_frames and primary_frame is not None:
             active_frames[0] = YOLOFireSmokeDetector.draw_boxes_on_frame(primary_frame, yolo_result)
 
         display = construct_3x3_grid(active_frames)
-        # Write the HUD directly inside the primary 320×240 camera tile.
-        draw_browser_camera_hud(display[:240, :320], fps, bool(yolo_result.get("detected")),
-                                int(st.session_state.get("inference_count", 0)),
-                                st.session_state.get("yolo_severity", "NORMAL"), pressure)
+
+        severity = st.session_state.get("yolo_severity", "NORMAL")
+        yolo_status = "DETECTED" if yolo_result.get("detected") else "CLEAR"
+
+        hud_line_1 = f"FPS: {fps:.1f} | YOLO: {yolo_status}"
+        hud_line_2 = f"INF: {st.session_state.get('inference_count', 0)} | STATUS: {severity}"
+
+        overlay = display.copy()
+        cv2.rectangle(overlay, (10, 10), (430, 82), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.50, display, 0.50, 0, display)
+
+        cv2.putText(display, hud_line_1, (20, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
+        cv2.putText(display, hud_line_2, (20, 65), cv2.FONT_HERSHEY_SIMPLEX, 0.50, (0, 255, 0), 2)
 
         display_rgb = cv2.cvtColor(display, cv2.COLOR_BGR2RGB)
         st.session_state.last_frame_rgb = display_rgb
@@ -3741,69 +3315,6 @@ def render_snapshot_camera() -> None:
             st.success("No fire or smoke detected in this photo.", icon=":material/check_circle:")
         else:
             st.error(f"Hazard detected — severity {severity}.", icon=":material/dangerous:")
-
-
-def _start_camera() -> None:
-    """Start once on the widget event before the next Streamlit script run.
-
-    Crucially this does not call st.rerun(): an extra rerun while the WebRTC
-    iframe is negotiating can tear down a newly opened browser camera.
-    """
-    st.session_state.camera_running = True
-    st.session_state.last_error = ""
-    st.session_state.last_vlm_candidate_frame = None
-    st.session_state.latest_vlm_text = ""
-    st.session_state.last_frame_time = time.time()
-    st.session_state.camera_started_at = time.time()
-    st.session_state.last_frame_rgb = None
-    st.session_state.last_resolution = ""
-    st.session_state.latest_detection = None
-    st.session_state.yolo_severity = "NORMAL"
-    st.session_state.yolo_detection = None
-    st.session_state.yolo_detection_in_progress = False
-    st.session_state.visual_smoke_streak = 0
-    st.session_state.visual_fire_streak = 0
-    st.session_state.visual_prev_frame = None
-    st.session_state.last_visual_result = None
-    st.session_state.last_pipeline_ts = 0.0
-    st.session_state.last_local_pipeline_ts = 0.0
-    st.session_state.last_local_yolo_result = None
-    st.session_state.frames_received = 0
-    st.session_state.last_cloud_hazard_type = ""
-    st.session_state.alarm_active = False
-    st.session_state.active_hazard_toast = None
-    st.session_state._frame_processing_busy = False
-    st.session_state._frame_processing_busy_since = 0.0
-    st.session_state.webrtc_manual_start = False
-    st.session_state.webrtc_auto_reconnect_history = []
-
-    if st.session_state.get("use_webrtc"):
-        # Retain the component identity prepared by Stop/reconnect instead of
-        # changing it a second time while mounting the player.
-        st.session_state.webrtc_ctx = None
-        st.session_state.get("_cam_holder", {}).clear()
-    # Avoid loading YOLO in the Start button callback. The camera widget
-    # initialises the detector on its own script pass.
-
-
-def _stop_camera() -> None:
-    """Stop the transport; prepare one fresh widget identity for next Start."""
-    st.session_state.camera_running = False
-    st.session_state.yolo_severity = "NORMAL"
-    st.session_state.alarm_active = False
-    st.session_state.active_hazard_toast = None
-    st.session_state._frame_processing_busy = False
-    st.session_state._frame_processing_busy_since = 0.0
-    st.session_state.get("_cam_holder", {}).clear()
-    st.session_state.webrtc_ctx = None
-    st.session_state.fps = 0.0
-    st.session_state.frames_received = 0
-    st.session_state.last_visual_result = None
-    st.session_state.visual_prev_frame = None
-    st.session_state.webrtc_manual_start = False
-    if st.session_state.get("use_webrtc"):
-        st.session_state.webrtc_connection_id += 1
-    release_camera()
 
 
 def render_video_feed() -> None:
@@ -3884,6 +3395,10 @@ def render_video_feed() -> None:
 
     live_camera_fragment()
 
+
+# =============================================================================
+# DATA LOGS (includes Export Reports)
+# =============================================================================
 def _build_forensic_display_df() -> Optional[pd.DataFrame]:
     if not st.session_state.alert_history:
         return None
@@ -4027,7 +3542,6 @@ def main() -> None:
         render_login_page()
         return
 
-    start_resource_monitor()
     start_sync_thread()
     inject_custom_css()
 
