@@ -40,7 +40,7 @@ YOLO_INFERENCE_LOCK = threading.Lock()
 RESOURCE_LOAD_LOCK = threading.Lock()
 RESOURCE_LOAD = {"level": 0, "cpu": 0.0, "ram": 0.0, "updated_at": 0.0,
                  "cpu_host": 0.0, "cpu_process": 0.0, "downshift_since": 0.0}
-RESOURCE_DOWNSHIFT_HOLD_SEC = 4.0
+RESOURCE_DOWNSHIFT_HOLD_SEC = 10.0
 # Google Cloud clients are created only on the Streamlit script thread.
 # Background upload threads never call st.secrets / st.cache_resource.
 CLOUD_CLIENTS_LOCK = threading.Lock()
@@ -196,12 +196,12 @@ CONFIG: Dict[str, Any] = {
     "CAMERA_SOURCES": [0],  # Primary webcam only; probing 9 devices causes phantom feeds/hangs
     "WEBRTC_ANALYSIS_WIDTH": 320,       # limit browser-side OpenCV analysis resolution
     "WEBRTC_TICK_SEC": 1.0,             # analysis/status tick; browser video is independent
-    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 1.75,  # scheduled CPU inference stays off real-time video path
-    "WEBRTC_SAMPLE_INTERVAL_SEC": 0.4,   # analysis only: maximum 2.5 samples/s, stream still sends every frame
+    "WEBRTC_YOLO_MIN_INTERVAL_SEC": 1.75,  # L0 only; L1/L2 are dynamically slower
+    "WEBRTC_SAMPLE_INTERVAL_SEC": 0.4,   # analysis only; browser camera stays live during throttling
     "WEBRTC_STALL_WARNING_SEC": 6.0,  # show a reconnect action once frames stop
     "YOLO_CPU_THREADS": 1,  # preserve CPU capacity for WebRTC encoding and UI
     "WEBRTC_YOLO_RESULT_TTL_SEC": 3.0,  # boxes older than this are dropped
-    "WEBRTC_FRAME_MAX_AGE_SEC": 5.0,    # tolerate adaptive sampling under CPU pressure
+    "WEBRTC_FRAME_MAX_AGE_SEC": 8.0,    # leave headroom for the L2 sampling interval
     "LOCAL_PIPELINE_INTERVAL_SEC": 0.65,  # keep local camera redraws independent of AI inference
     "SNAPSHOT_ANALYSIS_WIDTH": 640,
     "CAMERA_CONNECT_HINT_SEC": 15,
@@ -1198,11 +1198,13 @@ class ResourceGovernor:
                 RESOURCE_LOAD["cpu_process"] = float(cpu_process)
         if level != previous:
             LOG.warning("Adaptive throttling L%d -> L%d; CPU %.2f%%, RAM %.2f%%; "
-                        "YOLO every %.1fs, pipeline every %.1fs, input %dpx",
+                        "YOLO every %.1fs, pipeline every %.1fs, input %dpx, "
+                        "WebRTC overlays %s",
                         previous, level, cpu, ram,
-                        (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 3.0, 5.0)[level],
-                        (1.0, 1.7, 2.7)[level],
-                        (CONFIG["YOLO_IMAGE_SIZE"], 352, 320)[level])
+                        (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 4.5, 8.0)[level],
+                        (1.0, 2.0, 3.5)[level],
+                        (CONFIG["YOLO_IMAGE_SIZE"], 320, 256)[level],
+                        "suspended (raw pass-through)" if level == 2 else "enabled")
         return level
 
     @staticmethod
@@ -1240,15 +1242,30 @@ class ResourceGovernor:
 
     @staticmethod
     def yolo_interval() -> float:
-        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 3.0, 5.0)[ResourceGovernor.level()]
+        # Keep smoke/fire detection active even at L2, but run expensive model
+        # inference less frequently when the hosted CPU is saturated.
+        return (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 4.5, 8.0)[ResourceGovernor.level()]
 
     @staticmethod
     def pipeline_interval() -> float:
-        return (1.0, 1.7, 2.7)[ResourceGovernor.level()]
+        return (1.0, 2.0, 3.5)[ResourceGovernor.level()]
+
+    @staticmethod
+    def sample_interval() -> float:
+        return (CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"], 1.0, 1.4)[ResourceGovernor.level()]
+
+    @staticmethod
+    def yolo_result_ttl() -> float:
+        # Keep the last YOLO result long enough for one throttled analysis
+        # tick, but do not leave a stale fire/smoke result up for the full
+        # inference interval if the camera scene has already changed.
+        return max(CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"],
+                   ResourceGovernor.pipeline_interval() + 1.0)
 
     @staticmethod
     def yolo_image_size() -> int:
-        return (CONFIG["YOLO_IMAGE_SIZE"], 352, 320)[ResourceGovernor.level()]
+        # YOLO needs multiples of 32. Smaller tiles reduce model FLOPs.
+        return (CONFIG["YOLO_IMAGE_SIZE"], 320, 256)[ResourceGovernor.level()]
 
     @staticmethod
     def recommended_token_budget() -> int:
@@ -1423,17 +1440,9 @@ def draw_browser_camera_hud(frame_bgr: np.ndarray, fps: float, yolo_detected: bo
         (f"FPS: {fps:.1f} | YOLO: {'DETECTED' if yolo_detected else 'CLEAR'}", (0, 255, 0)),
         (f"INF: {inference_count} | STATUS: {severity}", color),
     )
-    # Reconstruct the tiny title area before painting its single green label.
-    # Some existing frames / old 3x3 composites carry a previously stamped
-    # black CAM_01 label. Inpainting just this ROI clears any old lettering
-    # without adding a black backdrop or erasing the rest of the camera feed.
-    if h >= 35 and w >= 90:
-        right = min(w, 240)
-        region = frame_bgr[2:31, 2:right]
-        if region.shape[0] >= 27 and region.shape[1] >= 82:
-            mask = np.zeros(region.shape[:2], dtype=np.uint8)
-            mask[3:24, 4:-4] = 255
-            region[:] = cv2.inpaint(region, mask, 2, cv2.INPAINT_TELEA)
+    # Browser camera samples are fresh, unannotated frames. Inpainting this
+    # region on every received frame was a costly and unnecessary CPU hotspot.
+    # The original CAM_01 HUD text remains identical at L0/L1.
 
     for row, (message, text_color) in enumerate(lines):
         x, y = 9, 19 + row * 22
@@ -1504,10 +1513,10 @@ if WEBRTC_AVAILABLE:
 
         def recv(self, frame):
             now = time.monotonic()
-            # Independent CPU/RAM sampling lets the WebRTC worker throttle
-            # before Streamlit's resource-metrics fragment refreshes.
+            # Sample only at the governor's cadence, without delaying the live
+            # video or relying on a Streamlit UI fragment to apply throttling.
             throttle_level = ResourceGovernor.poll_runtime_pressure()
-            sample_interval = CONFIG["WEBRTC_SAMPLE_INTERVAL_SEC"] * (1, 2, 4)[throttle_level]
+            sample_interval = ResourceGovernor.sample_interval()
             with self._lock:
                 previous = self._last_tick
                 self._last_tick = now
@@ -1520,7 +1529,7 @@ if WEBRTC_AVAILABLE:
                 needs_sample = now - self._last_sample_attempt_ts >= sample_interval
                 if needs_sample:
                     self._last_sample_attempt_ts = now
-                recent = now - self._yolo_result_ts <= CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
+                recent = now - self._yolo_result_ts <= ResourceGovernor.yolo_result_ttl()
                 yolo = self._yolo_result if recent else None
                 hud_severity = self._analysis_severity
                 inference_count = self._inference_count
@@ -1562,9 +1571,17 @@ if WEBRTC_AVAILABLE:
                             self._yolo_busy = False
                         LOG.warning("YOLO background thread unavailable: %s", exc)
 
-            # Always render the compact three-line HUD, including between YOLO
-            # detections. 320x240 greatly reduces the per-frame encode cost;
-            # a rendering error still passes through the original frame.
+            # CRITICAL (L2): avoid a second decode + frame allocation + OpenCV
+            # draw/encode path on *every* camera frame. Forward the original
+            # PyAV frame directly. The detector above still gets scheduled
+            # samples; alarm/logging stay active in the Streamlit pipeline.
+            # Temporary HUD / YOLO box suspension is a deliberate CPU-saving
+            # tradeoff, not a camera disconnect or an inference shutdown.
+            if throttle_level >= 2:
+                return frame
+
+            # L0/L1: retain the original live video overlay. Rendering errors
+            # must never interrupt browser camera playback.
             try:
                 # Decoding is required for a HUD embedded in a SENDRECV video.
                 # The smaller capture avoids repeated 480x360 frame transformations.
@@ -1598,7 +1615,7 @@ if WEBRTC_AVAILABLE:
                     or now - self._last_frame_ts > CONFIG["WEBRTC_FRAME_MAX_AGE_SEC"]
                 ):
                     return None, None, 0.0
-                fresh = now - self._yolo_result_ts <= CONFIG["WEBRTC_YOLO_RESULT_TTL_SEC"]
+                fresh = now - self._yolo_result_ts <= ResourceGovernor.yolo_result_ttl()
                 result = self._yolo_result if fresh else None
                 return self._latest_frame.copy(), result, self._fps
 
@@ -2891,9 +2908,12 @@ def run_detection_pipeline(
         }
 
 
+    # Browser samples arrive on allowed, time-gated pipeline ticks only.
+    # Keep visual smoke fallback on every allowed tick so pressure does not
+    # disable fire/smoke detection. Local mode still uses its frame counter.
     run_visual_now = (
         sync
-        or yolo_override is not None  # browser: small frame; keep smoke fallback responsive
+        or yolo_override is not None
         or st.session_state.get("last_visual_result") is None
         or frame_number % max(1, CONFIG["VISUAL_DETECT_EVERY_N_FRAMES"] *
                                (1 + ResourceGovernor.level())) == 0
@@ -3218,6 +3238,26 @@ def _render_resource_metrics_body() -> None:
     else:
         st.metric("Avg Latency", "—")
 
+    # This fragment updates independently every 2 s even when WebRTC remains
+    # mounted. It reports the *applied* governor level, not a guessed warning.
+    level = ResourceGovernor.level()
+    if level == 2:
+        st.warning(
+            "Throttle L2 active: live camera pass-through; video HUD/boxes "
+            f"paused. YOLO ≥{ResourceGovernor.yolo_interval():.1f}s, "
+            f"analysis ≥{ResourceGovernor.pipeline_interval():.1f}s. "
+            "Smoke/fire alerts remain enabled.",
+            icon=":material/speed:",
+        )
+    elif level == 1:
+        st.caption(
+            "Throttle L1 active · "
+            f"YOLO ≥{ResourceGovernor.yolo_interval():.1f}s · "
+            f"analysis ≥{ResourceGovernor.pipeline_interval():.1f}s"
+        )
+    else:
+        st.caption("Throttle L0 · Normal processing")
+
     if st.session_state.last_error:
         st.info("Model/YARA backend notice: Active fallback running.")
 
@@ -3472,9 +3512,9 @@ def _live_webrtc_body() -> None:
         st.session_state.last_frame_time = tick
         st.session_state.frames_processed += 1
 
-        target_w = CONFIG["WEBRTC_ANALYSIS_WIDTH"]
+        target_w = min(CONFIG["WEBRTC_ANALYSIS_WIDTH"], w)
         target_h = max(1, int(round(h * target_w / max(w, 1))))
-        small = cv2.resize(frame, (target_w, target_h))
+        small = frame if (w == target_w and h == target_h) else cv2.resize(frame, (target_w, target_h))
 
         # YOLO boxes in `yolo` are in full-frame coordinates; the pipeline only
         # needs the detections/severity, not the pixels.
@@ -3805,8 +3845,19 @@ def render_analytics_page() -> None:
 
 def render_dashboard_page() -> None:
     metrics = SystemMonitor.get_metrics()
-    if metrics["cpu"] > 90.0 or metrics["ram"] > 88.0:
-        st.error(f"Critical System Load! CPU: {metrics['cpu']:.2f}% | RAM: {metrics['ram']:.2f}%. System throttling.", icon=":material/error:")
+    if ResourceGovernor.level() == 2:
+        st.error(
+            f"Critical System Load! CPU: {metrics['cpu']:.2f}% | "
+            f"RAM: {metrics['ram']:.2f}%. Throttle L2 ACTIVE "
+            "(lightweight camera pass-through; reduced AI analysis).",
+            icon=":material/error:",
+        )
+    elif ResourceGovernor.level() == 1:
+        st.warning(
+            f"High System Load! CPU: {metrics['cpu']:.2f}% | "
+            f"RAM: {metrics['ram']:.2f}%. Throttle L1 ACTIVE.",
+            icon=":material/warning:",
+        )
 
     render_dashboard_header()
 
