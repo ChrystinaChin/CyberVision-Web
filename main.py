@@ -580,6 +580,7 @@ def init_session_state() -> None:
         "browser_cam_mode": BROWSER_MODE_LIVE,
         "webrtc_ctx": None,
         "webrtc_connection_id": 0,
+        "webrtc_manual_start": False,
         "webrtc_auto_reconnect_history": [],
         "_frame_processing_busy": False,
         "_frame_processing_busy_since": 0.0,
@@ -2056,13 +2057,19 @@ def render_browser_camera_widget() -> None:
         ctx = webrtc_streamer(
             key=f"cybervision-browser-camera-v3-{st.session_state.get('webrtc_connection_id', 0)}",
             mode=WebRtcMode.SENDRECV,
-            desired_playing_state=True,
+            # Let the built-in START control take over if autoplay cannot get
+            # browser permission. Automatic mode is the default.
+            desired_playing_state=(
+                None if st.session_state.get("webrtc_manual_start", False) else True
+            ),
             rtc_configuration={"iceServers": ice_servers},
+            # These are preferences rather than hard maximums. Some cameras
+            # reject max=320/max=240 with OverconstrainedError.
             media_stream_constraints={
                 "video": {
-                    "width": {"ideal": 320, "max": 320},
-                    "height": {"ideal": 240, "max": 240},
-                    "frameRate": {"ideal": 10, "max": 10},
+                    "width": {"ideal": 320},
+                    "height": {"ideal": 240},
+                    "frameRate": {"ideal": 10},
                 },
                 "audio": False,
             },
@@ -2086,6 +2093,12 @@ def render_browser_camera_widget() -> None:
     state = getattr(ctx, "state", None)
     playing = bool(state is not None and getattr(state, "playing", False))
     ice_note = _describe_ice_servers(ice_servers)
+
+    if st.session_state.get("webrtc_manual_start", False) and not playing:
+        st.info(
+            "Automatic camera startup did not complete. Click **START** in the "
+            "camera player below and allow browser camera access."
+        )
 
     if ice_note.startswith(":material/info:") and not playing:
         st.warning(
@@ -3556,6 +3569,15 @@ def _live_webrtc_body() -> None:
         if frame is None:
             st.session_state.fps = 0.0
             waited = time.time() - (st.session_state.get("camera_started_at") or time.time())
+            # Programmatic browser start may be disallowed on some devices.
+            # Offer the component's own gesture-driven START button rather than
+            # leaving the app indefinitely stuck on CONNECTING.
+            if (processor is None and waited >= 9.0
+                    and not st.session_state.get("webrtc_manual_start", False)):
+                st.session_state.webrtc_manual_start = True
+                # A full rerun is required to change the WebRTC component prop;
+                # it happens only once and before any frames have arrived.
+                st.rerun()
             health = processor.health() if processor is not None else {}
             last_age = health.get("age_sec")
             stalled = bool(health.get("ended")) or (
@@ -3572,6 +3594,7 @@ def _live_webrtc_body() -> None:
                     if len(history) < 2 and (not history or now - history[-1] >= 60):
                         st.session_state.webrtc_auto_reconnect_history = history + [now]
                         st.session_state.webrtc_connection_id += 1
+                        st.session_state.webrtc_manual_start = False
                         st.session_state.get("_cam_holder", {}).clear()
                         st.session_state.webrtc_ctx = None
                         st.session_state.camera_started_at = time.time()
@@ -3582,6 +3605,7 @@ def _live_webrtc_body() -> None:
                 status_slot.warning(_connection_help_text(), icon=":material/warning:")
                 if st.button("Reconnect Camera", key="reconnect_browser_camera", type="primary"):
                     st.session_state.webrtc_connection_id += 1
+                    st.session_state.webrtc_manual_start = False
                     st.session_state.get("_cam_holder", {}).clear()
                     st.session_state.webrtc_ctx = None
                     st.session_state.camera_started_at = time.time()
@@ -3755,6 +3779,69 @@ def render_snapshot_camera() -> None:
             st.error(f"Hazard detected — severity {severity}.", icon=":material/dangerous:")
 
 
+def _start_camera() -> None:
+    """Start once on the widget event before the next Streamlit script run.
+
+    Crucially this does not call st.rerun(): an extra rerun while the WebRTC
+    iframe is negotiating can tear down a newly opened browser camera.
+    """
+    st.session_state.camera_running = True
+    st.session_state.last_error = ""
+    st.session_state.last_vlm_candidate_frame = None
+    st.session_state.latest_vlm_text = ""
+    st.session_state.last_frame_time = time.time()
+    st.session_state.camera_started_at = time.time()
+    st.session_state.last_frame_rgb = None
+    st.session_state.last_resolution = ""
+    st.session_state.latest_detection = None
+    st.session_state.yolo_severity = "NORMAL"
+    st.session_state.yolo_detection = None
+    st.session_state.yolo_detection_in_progress = False
+    st.session_state.visual_smoke_streak = 0
+    st.session_state.visual_fire_streak = 0
+    st.session_state.visual_prev_frame = None
+    st.session_state.last_visual_result = None
+    st.session_state.last_pipeline_ts = 0.0
+    st.session_state.last_local_pipeline_ts = 0.0
+    st.session_state.last_local_yolo_result = None
+    st.session_state.frames_received = 0
+    st.session_state.last_cloud_hazard_type = ""
+    st.session_state.alarm_active = False
+    st.session_state.active_hazard_toast = None
+    st.session_state._frame_processing_busy = False
+    st.session_state._frame_processing_busy_since = 0.0
+    st.session_state.webrtc_manual_start = False
+    st.session_state.webrtc_auto_reconnect_history = []
+
+    if st.session_state.get("use_webrtc"):
+        # Retain the component identity prepared by Stop/reconnect instead of
+        # changing it a second time while mounting the player.
+        st.session_state.webrtc_ctx = None
+        st.session_state.get("_cam_holder", {}).clear()
+    # Avoid loading YOLO in the Start button callback. The camera widget
+    # initialises the detector on its own script pass.
+
+
+def _stop_camera() -> None:
+    """Stop the transport; prepare one fresh widget identity for next Start."""
+    st.session_state.camera_running = False
+    st.session_state.yolo_severity = "NORMAL"
+    st.session_state.alarm_active = False
+    st.session_state.active_hazard_toast = None
+    st.session_state._frame_processing_busy = False
+    st.session_state._frame_processing_busy_since = 0.0
+    st.session_state.get("_cam_holder", {}).clear()
+    st.session_state.webrtc_ctx = None
+    st.session_state.fps = 0.0
+    st.session_state.frames_received = 0
+    st.session_state.last_visual_result = None
+    st.session_state.visual_prev_frame = None
+    st.session_state.webrtc_manual_start = False
+    if st.session_state.get("use_webrtc"):
+        st.session_state.webrtc_connection_id += 1
+    release_camera()
+
+
 def render_video_feed() -> None:
     if _browser_snapshot_mode():
         render_snapshot_camera()
@@ -3763,62 +3850,18 @@ def render_video_feed() -> None:
     header_col, btn_col1, btn_col2 = st.columns([6, 1, 1])
 
     with btn_col1:
-        if st.button("Start", icon=":material/play_arrow:", use_container_width=True, disabled=st.session_state.camera_running, key="start_cam_btn"):
-            st.session_state.camera_running = True
-            st.session_state.last_error = ""
-            st.session_state.last_vlm_candidate_frame = None
-            st.session_state.latest_vlm_text = ""
-            st.session_state.last_frame_time = time.time()
-            st.session_state.camera_started_at = time.time()
-            st.session_state.last_frame_rgb = None
-            st.session_state.last_resolution = ""
-            st.session_state.latest_detection = None
-            st.session_state.yolo_severity = "NORMAL"
-            st.session_state.yolo_detection = None
-            st.session_state.yolo_detection_in_progress = False
-            st.session_state.visual_smoke_streak = 0
-            st.session_state.visual_fire_streak = 0
-            st.session_state.visual_prev_frame = None
-            st.session_state.last_visual_result = None
-            st.session_state.last_pipeline_ts = 0.0
-            st.session_state.last_local_pipeline_ts = 0.0
-            st.session_state.last_local_yolo_result = None
-            st.session_state.frames_received = 0
-            st.session_state.last_cloud_hazard_type = ""
-            st.session_state.alarm_active = False
-            st.session_state.active_hazard_toast = None
-            st.session_state._frame_processing_busy = False
-            st.session_state._frame_processing_busy_since = 0.0
-
-            # Mount a fresh transport on every explicit Start, not the old
-            # component identity retained after Stop/reconnect.
-            if st.session_state.get("use_webrtc"):
-                st.session_state.webrtc_connection_id += 1
-                st.session_state.webrtc_ctx = None
-                st.session_state.get("_cam_holder", {}).clear()
-                st.session_state.webrtc_auto_reconnect_history = []
-
-            if st.session_state.get("yolo_detector") is None:
-                st.session_state.yolo_detector = YOLOFireSmokeDetector()
-
-            st.rerun()
+        st.button(
+            "Start", icon=":material/play_arrow:", use_container_width=True,
+            disabled=bool(st.session_state.camera_running), key="start_cam_btn",
+            on_click=_start_camera,
+        )
 
     with btn_col2:
-        if st.button("Stop", icon=":material/stop:", use_container_width=True, disabled=not st.session_state.camera_running, key="stop_cam_btn"):
-            st.session_state.camera_running = False
-            st.session_state.yolo_severity = "NORMAL"
-            st.session_state.alarm_active = False
-            st.session_state.active_hazard_toast = None
-            st.session_state._frame_processing_busy = False
-            st.session_state._frame_processing_busy_since = 0.0
-            st.session_state.get("_cam_holder", {}).clear()
-            st.session_state.webrtc_ctx = None
-            st.session_state.fps = 0.0
-            st.session_state.frames_received = 0
-            st.session_state.last_visual_result = None
-            st.session_state.visual_prev_frame = None
-            release_camera()
-            st.rerun()
+        st.button(
+            "Stop", icon=":material/stop:", use_container_width=True,
+            disabled=not bool(st.session_state.camera_running), key="stop_cam_btn",
+            on_click=_stop_camera,
+        )
 
     if st.session_state.get("webrtc_unavailable_on_cloud"):
         st.error(
