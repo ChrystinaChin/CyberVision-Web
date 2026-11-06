@@ -3238,25 +3238,9 @@ def _render_resource_metrics_body() -> None:
     else:
         st.metric("Avg Latency", "—")
 
-    # This fragment updates independently every 2 s even when WebRTC remains
-    # mounted. It reports the *applied* governor level, not a guessed warning.
-    level = ResourceGovernor.level()
-    if level == 2:
-        st.warning(
-            "Throttle L2 active: live camera pass-through; video HUD/boxes "
-            f"paused. YOLO ≥{ResourceGovernor.yolo_interval():.1f}s, "
-            f"analysis ≥{ResourceGovernor.pipeline_interval():.1f}s. "
-            "Smoke/fire alerts remain enabled.",
-            icon=":material/speed:",
-        )
-    elif level == 1:
-        st.caption(
-            "Throttle L1 active · "
-            f"YOLO ≥{ResourceGovernor.yolo_interval():.1f}s · "
-            f"analysis ≥{ResourceGovernor.pipeline_interval():.1f}s"
-        )
-    else:
-        st.caption("Throttle L0 · Normal processing")
+    # Adaptive throttling stays active in the ResourceGovernor, but its
+    # L0/L1/L2 status messages are intentionally hidden from the dashboard.
+    # Keep displaying the measured CPU/RAM values above.
 
     if st.session_state.last_error:
         st.info("Model/YARA backend notice: Active fallback running.")
@@ -3844,21 +3828,8 @@ def render_analytics_page() -> None:
 
 
 def render_dashboard_page() -> None:
-    metrics = SystemMonitor.get_metrics()
-    if ResourceGovernor.level() == 2:
-        st.error(
-            f"Critical System Load! CPU: {metrics['cpu']:.2f}% | "
-            f"RAM: {metrics['ram']:.2f}%. Throttle L2 ACTIVE "
-            "(lightweight camera pass-through; reduced AI analysis).",
-            icon=":material/error:",
-        )
-    elif ResourceGovernor.level() == 1:
-        st.warning(
-            f"High System Load! CPU: {metrics['cpu']:.2f}% | "
-            f"RAM: {metrics['ram']:.2f}%. Throttle L1 ACTIVE.",
-            icon=":material/warning:",
-        )
-
+    # Resource overload banners are hidden by design; ResourceGovernor
+    # still controls processing rates independently of the dashboard UI.
     render_dashboard_header()
 
     video_col, stats_col = st.columns([2.6, 1], gap="medium")
@@ -3925,3 +3896,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+    
