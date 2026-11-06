@@ -1197,7 +1197,7 @@ class ResourceGovernor:
             if cpu_process is not None:
                 RESOURCE_LOAD["cpu_process"] = float(cpu_process)
         if level != previous:
-            LOG.warning("Adaptive throttling L%d -> L%d; CPU %.1f%%, RAM %.1f%%; "
+            LOG.warning("Adaptive throttling L%d -> L%d; CPU %.2f%%, RAM %.2f%%; "
                         "YOLO every %.1fs, pipeline every %.1fs, input %dpx",
                         previous, level, cpu, ram,
                         (CONFIG["WEBRTC_YOLO_MIN_INTERVAL_SEC"], 3.0, 5.0)[level],
@@ -1223,7 +1223,7 @@ class ResourceGovernor:
         with RESOURCE_LOAD_LOCK:
             cpu, ram = RESOURCE_LOAD["cpu"], RESOURCE_LOAD["ram"]
         st.session_state.last_public_notice = (
-            f"Adaptive throttling L{level}: CPU={cpu:.1f}%, RAM={ram:.1f}%. "
+            f"Adaptive throttling L{level}: CPU={cpu:.2f}%, RAM={ram:.2f}%. "
             "YOLO, sampling, and analysis frequency are reduced."
             if level else ""
         )
@@ -1340,15 +1340,59 @@ def _resource_monitor_loop() -> None:
 
 
 @st.cache_resource(show_spinner=False)
-def _start_resource_monitor_once() -> bool:
-    # The monitor is process-wide, not per-session. It never touches Streamlit.
-    threading.Thread(target=_resource_monitor_loop, daemon=True,
-                     name="cybervision-resource-governor").start()
-    return True
+def _shared_resource_monitor_state() -> Dict[str, Any]:
+    """Persist metrics AND the sampling thread across Streamlit script reruns.
+
+    A cached thread with an uncached module-level RESOURCE_LOAD dictionary wrote
+    into the previous script run's globals, leaving the new UI showing 0.00%.
+    Both the producer and the UI must use these same shared objects.
+    """
+    return {
+        "lock": threading.Lock(),
+        "start_lock": threading.Lock(),
+        "load": {
+            "level": 0, "cpu": 0.0, "ram": 0.0, "updated_at": 0.0,
+            "cpu_host": 0.0, "cpu_process": 0.0,
+            "downshift_since": 0.0,
+        },
+        "thread": None,
+    }
 
 
 def start_resource_monitor() -> None:
-    _start_resource_monitor_once()
+    global RESOURCE_LOAD, RESOURCE_LOAD_LOCK
+
+    shared = _shared_resource_monitor_state()
+    # Rebind on EACH script rerun, including when another browser session opens.
+    # The already-running sampler uses this exact same cached dict and lock.
+    RESOURCE_LOAD = shared["load"]
+    RESOURCE_LOAD_LOCK = shared["lock"]
+
+    with shared["start_lock"]:
+        worker = shared["thread"]
+        if worker is not None and worker.is_alive():
+            return
+
+        # Immediately populate the values so the first render doesn't show the
+        # uninitialized 0% placeholders. The worker takes over after startup.
+        # This is the only foreground sample; no samples run in fragments/video.
+        try:
+            host_cpu = float(psutil.cpu_percent(interval=0.1))
+            ram = max(float(psutil.virtual_memory().percent),
+                      _cgroup_memory_percent())
+            ResourceGovernor._publish_pressure(
+                host_cpu, ram, time.monotonic(),
+                cpu_host=host_cpu, cpu_process=0.0)
+        except (psutil.Error, OSError, ValueError) as exc:
+            LOG.warning("Initial resource reading failed: %s", exc)
+
+        worker = threading.Thread(
+            target=_resource_monitor_loop,
+            daemon=True,
+            name="cybervision-resource-governor",
+        )
+        shared["thread"] = worker
+        worker.start()
 
 
 def draw_browser_camera_hud(frame_bgr: np.ndarray, fps: float, yolo_detected: bool,
@@ -3163,10 +3207,10 @@ def _render_resource_metrics_body() -> None:
     m1, m2 = st.columns(2)
     with m1:
         with st.container(key=f"cpu_metric_{cpu_class}"):
-            st.metric("CPU", f"{metrics['cpu']:.1f}%", cpu_delta)
+            st.metric("CPU", f"{metrics['cpu']:.2f}%", cpu_delta)
     with m2:
         with st.container(key=f"ram_metric_{ram_class}"):
-            st.metric("RAM", f"{metrics['ram']:.1f}%", ram_delta)
+            st.metric("RAM", f"{metrics['ram']:.2f}%", ram_delta)
 
     if st.session_state.latency_history:
         avg_latency = sum(st.session_state.latency_history) / len(st.session_state.latency_history)
@@ -3185,7 +3229,7 @@ def _render_resource_metrics_body() -> None:
 
 def render_resource_metrics_panel() -> None:
     # Fragments refresh metrics without remounting WebRTC or the setup controls.
-    refresh = 3.0 if st.session_state.get("camera_running", False) else None
+    refresh = 2.0  # Refresh in STANDBY too; independent of WebRTC/camera.
     st.fragment(_render_resource_metrics_body, run_every=refresh)()
 
 
@@ -3762,7 +3806,7 @@ def render_analytics_page() -> None:
 def render_dashboard_page() -> None:
     metrics = SystemMonitor.get_metrics()
     if metrics["cpu"] > 90.0 or metrics["ram"] > 88.0:
-        st.error(f"Critical System Load! CPU: {metrics['cpu']}% | RAM: {metrics['ram']}%. System throttling.", icon=":material/error:")
+        st.error(f"Critical System Load! CPU: {metrics['cpu']:.2f}% | RAM: {metrics['ram']:.2f}%. System throttling.", icon=":material/error:")
 
     render_dashboard_header()
 
