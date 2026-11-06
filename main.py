@@ -3827,9 +3827,27 @@ def render_analytics_page() -> None:
     render_charts()
 
 
+def _render_critical_system_load_banner() -> None:
+    """Show only the short critical-load notice; leave the governor enabled."""
+    if ResourceGovernor.level() != 2:
+        return
+
+    # Use the same process-wide measurements used for adaptive throttling.
+    with RESOURCE_LOAD_LOCK:
+        cpu = float(RESOURCE_LOAD["cpu"])
+        ram = float(RESOURCE_LOAD["ram"])
+
+    st.error(
+        f"Critical System Load! CPU: {cpu:.2f}% | "
+        f"RAM: {ram:.2f}%. System throttling.",
+        icon=":material/error:",
+    )
+
+
 def render_dashboard_page() -> None:
-    # Resource overload banners are hidden by design; ResourceGovernor
-    # still controls processing rates independently of the dashboard UI.
+    # Refresh the critical warning independently without restarting WebRTC.
+    # Do not show additional L1/L2 throttling notices in the resources panel.
+    st.fragment(_render_critical_system_load_banner, run_every=2.0)()
     render_dashboard_header()
 
     video_col, stats_col = st.columns([2.6, 1], gap="medium")
@@ -3896,4 +3914,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-    
